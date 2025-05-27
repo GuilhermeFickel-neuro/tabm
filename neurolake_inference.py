@@ -5,14 +5,20 @@
 TabM Inference Script for Custom CSV Datasets
 
 Loads a trained TabM model and preprocessing pipeline to make predictions on new data.
+Optionally calculates KS statistics from inference outputs for feature analysis.
 
 Usage:
+    # Basic inference
     python neurolake_inference.py --data_path new_data.csv --model_path saved_model/model.pth --preprocessing_path saved_model/preprocessing.pkl --output_path predictions.csv
+    
+    # With KS statistics calculation (binary classification only)
+    python neurolake_inference.py --data_path new_data.csv --model_path saved_model/model.pth --preprocessing_path saved_model/preprocessing.pkl --output_path predictions.csv --calculate_ks --target_column alvo
 
 Requirements:
     - CSV file with same structure as training data (excluding target column)
     - Trained model file (.pth)
     - Preprocessing pipeline file (.pkl)
+    - ks_utils.py (optional, for KS statistics calculation)
 """
 
 import argparse
@@ -31,6 +37,14 @@ from torch import Tensor
 warnings.simplefilter('ignore')
 from tabm_reference import Model
 warnings.resetwarnings()
+
+# Import KS statistics utilities
+try:
+    from ks_utils import calculate_ks_for_dataframe, print_ks_summary
+    KS_UTILS_AVAILABLE = True
+except ImportError:
+    KS_UTILS_AVAILABLE = False
+    print("Warning: ks_utils not available. KS statistics will be skipped.")
 
 
 def load_model_and_preprocessing(model_path: str, preprocessing_path: str, device: torch.device):
@@ -245,6 +259,96 @@ def make_predictions(
         return y_pred_class, y_pred_proba
 
 
+def calculate_ks_from_inference(
+    original_df: pd.DataFrame,
+    predictions_df: pd.DataFrame,
+    model_config: dict,
+    feature_info: dict,
+    output_path: str
+):
+    """
+    Calculate KS statistics from inference outputs.
+    
+    Args:
+        original_df: Original dataframe with features
+        predictions_df: DataFrame with predictions
+        model_config: Model configuration
+        feature_info: Feature information from preprocessing
+        output_path: Base path for saving KS results
+    """
+    if not KS_UTILS_AVAILABLE:
+        print("⚠️  KS statistics calculation skipped (ks_utils not available)")
+        return
+    
+    task_type = model_config['task_type']
+    target_column = feature_info['target_column']
+    
+    # Only calculate KS for binary classification tasks
+    if task_type != 'binclass':
+        print(f"⚠️  KS statistics only available for binary classification. Current task: {task_type}")
+        return
+    
+    # Check if we have predictions to use as pseudo-targets
+    if 'predicted_class' not in predictions_df.columns:
+        print("⚠️  No predicted_class column found for KS calculation")
+        return
+    
+    print(f"\n🔄 Calculating KS statistics from inference outputs...")
+    print(f"📊 Using predicted classes as pseudo-targets for KS analysis")
+    
+    # Create a combined dataframe with original features and predictions
+    analysis_df = original_df.copy()
+    
+    # Use predicted classes as the target for KS analysis
+    analysis_df['predicted_target'] = predictions_df['predicted_class']
+    
+    # Remove identifier columns for KS analysis
+    identifier_columns = feature_info.get('identifier_columns', ['cpf', 'ref_date', 'id', 'customer_id'])
+    
+    try:
+        # Calculate KS statistics using predicted classes as target
+        ks_results = calculate_ks_for_dataframe(
+            analysis_df, 
+            target_column='predicted_target',
+            exclude_columns=identifier_columns
+        )
+        
+        # Print summary
+        print_ks_summary(analysis_df, target_column='predicted_target', top_n=15)
+        
+        # Save KS results
+        ks_output_path = output_path.replace('.csv', '_ks_statistics.csv')
+        ks_results.to_csv(ks_output_path, index=False)
+        
+        print(f"\n📊 KS Statistics Analysis:")
+        print(f"   - Total features analyzed: {len(ks_results)}")
+        print(f"   - Features with KS > 0.1: {(ks_results['ks_statistic'] > 0.1).sum()}")
+        print(f"   - Features with KS > 0.2: {(ks_results['ks_statistic'] > 0.2).sum()}")
+        print(f"   - Mean KS statistic: {ks_results['ks_statistic'].mean():.4f}")
+        print(f"   - Max KS statistic: {ks_results['ks_statistic'].max():.4f}")
+        
+        # Show top discriminative features
+        top_features = ks_results.head(5)
+        print(f"\n🏆 Top 5 most discriminative features:")
+        for _, row in top_features.iterrows():
+            print(f"   {row['ks_rank']}. {row['feature']:<25} KS: {row['ks_statistic']:.4f}")
+        
+        print(f"\n💾 KS statistics saved to: {ks_output_path}")
+        
+        # Add KS summary to predictions metadata
+        if hasattr(predictions_df, 'attrs'):
+            predictions_df.attrs['ks_summary'] = {
+                'total_features': len(ks_results),
+                'mean_ks': ks_results['ks_statistic'].mean(),
+                'max_ks': ks_results['ks_statistic'].max(),
+                'top_features': ks_results.head(5)['feature'].tolist(),
+                'high_ks_count': (ks_results['ks_statistic'] > 0.2).sum()
+            }
+        
+    except Exception as e:
+        print(f"⚠️  Error calculating KS statistics: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Make predictions using trained TabM model')
     parser.add_argument('--data_path', type=str, required=True, help='Path to CSV file for inference')
@@ -254,6 +358,10 @@ def main():
     parser.add_argument('--sep', type=str, default=',',
                        help='CSV separator (default: comma). Use "\\t" for tab-separated files')
     parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for inference')
+    parser.add_argument('--calculate_ks', action='store_true', 
+                       help='Calculate KS statistics from inference outputs (binary classification only)')
+    parser.add_argument('--target_column', type=str, default='alvo',
+                       help='Name of target column for KS analysis (default: alvo)')
     
     args = parser.parse_args()
     
@@ -315,6 +423,19 @@ def main():
     
     print(f'\n✅ Predictions saved to: {args.output_path}')
     print(f'📊 Processed {len(output_df)} samples')
+    
+    # Calculate KS statistics if requested
+    if args.calculate_ks:
+        # Store original target column name in feature_info for KS analysis
+        feature_info['target_column'] = args.target_column
+        
+        calculate_ks_from_inference(
+            original_df=df,
+            predictions_df=output_df,
+            model_config=model_config,
+            feature_info=feature_info,
+            output_path=args.output_path
+        )
 
 
 if __name__ == '__main__':
