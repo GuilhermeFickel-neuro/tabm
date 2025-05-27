@@ -116,7 +116,7 @@ def load_csv_dataset(
         raise ValueError(f"Target column '{target_column}' not found in dataset")
     
     # Identify and exclude identifier columns (common patterns)
-    identifier_patterns = ['cpf', 'id', 'ref_date', 'date', 'timestamp']
+    identifier_patterns = ['cpf', 'ref_date', 'date', 'timestamp']
     identifier_columns = []
     for col in df.columns:
         if col.lower() != target_column.lower():  # Don't exclude target
