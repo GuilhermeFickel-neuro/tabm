@@ -190,15 +190,24 @@ def setup_model_and_training(
         
         # Compute bins from training data (CRITICAL for piecewise-linear embeddings)
         train_x_cont = torch.as_tensor(data_splits['train']['x_cont'], device=device)
-        bins = rtdl_num_embeddings.compute_bins(train_x_cont)
         
-        num_embeddings = {
-            'type': 'PiecewiseLinearEmbeddings',
-            'd_embedding': 16,
-            'activation': False,
-            'version': 'B',
-        }
-        print(f"Using TabM-mini with piecewise-linear embeddings (bins computed from {train_x_cont.shape[0]} training samples)")
+        # Check if dataset is large enough for bin computation
+        min_samples_for_bins = 50  # rtdl_num_embeddings typically needs at least 48 bins
+        if len(train_x_cont) < min_samples_for_bins:
+            print(f"Warning: Dataset too small ({len(train_x_cont)} samples) for optimal piecewise-linear embeddings.")
+            print(f"Falling back to standard TabM architecture.")
+            arch_type = 'tabm'
+            bins = None
+            num_embeddings = None
+        else:
+            bins = rtdl_num_embeddings.compute_bins(train_x_cont)
+            num_embeddings = {
+                'type': 'PiecewiseLinearEmbeddings',
+                'd_embedding': 16,
+                'activation': False,
+                'version': 'B',
+            }
+            print(f"Using TabM-mini with piecewise-linear embeddings (bins computed from {train_x_cont.shape[0]} training samples)")
     else:
         arch_type = 'tabm'
         print(f"Using standard TabM architecture")
@@ -406,7 +415,7 @@ def main():
     )
     
     print(f'Model created with {sum(p.numel() for p in model.parameters())} parameters')
-    print(f'Architecture: {"TabM-mini with piecewise-linear embeddings" if args.use_embeddings and n_num_features > 0 else "Standard TabM"}')
+    print(f'Architecture: {"TabM-mini with piecewise-linear embeddings" if model.arch_type == "tabm-mini" and model.num_module is not None else "Standard TabM"}')
     
     # Train model
     best_result = train_model(

@@ -359,6 +359,8 @@ def _init_first_adapter(
 class PiecewiseLinearEmbeddings(rtdl_num_embeddings.PiecewiseLinearEmbeddings):
     """
     This class simply adds the default values for `activation` and `version`.
+    The `version` parameter is accepted for compatibility but ignored since
+    the underlying rtdl_num_embeddings.PiecewiseLinearEmbeddings doesn't support it.
     """
 
     def __init__(
@@ -368,7 +370,8 @@ class PiecewiseLinearEmbeddings(rtdl_num_embeddings.PiecewiseLinearEmbeddings):
         version: None | Literal['A', 'B'] = 'B',
         **kwargs,
     ) -> None:
-        super().__init__(*args, **kwargs, activation=activation, version=version)
+        # Note: version parameter is ignored since the base class doesn't support it
+        super().__init__(*args, **kwargs, activation=activation)
 
 
 _CUSTOM_MODULES = {
