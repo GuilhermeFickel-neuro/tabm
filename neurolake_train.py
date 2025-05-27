@@ -22,6 +22,7 @@ Requirements:
 
 import argparse
 import math
+import pickle
 import random
 import warnings
 from pathlib import Path
@@ -48,6 +49,43 @@ warnings.resetwarnings()
 class RegressionLabelStats(NamedTuple):
     mean: float
     std: float
+
+
+def save_model_and_preprocessing(
+    model,
+    preprocessing_pipeline,
+    regression_label_stats,
+    feature_info,
+    model_config,
+    save_dir: str = "saved_model"
+):
+    """Save trained model and preprocessing components for inference."""
+    
+    save_path = Path(save_dir)
+    save_path.mkdir(exist_ok=True)
+    
+    # Save model state dict
+    model_path = save_path / "model.pth"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_config': model_config,
+    }, model_path)
+    
+    # Save preprocessing pipeline and metadata
+    preprocessing_path = save_path / "preprocessing.pkl"
+    preprocessing_data = {
+        'preprocessing_pipeline': preprocessing_pipeline,
+        'regression_label_stats': regression_label_stats,
+        'feature_info': feature_info,
+    }
+    
+    with open(preprocessing_path, 'wb') as f:
+        pickle.dump(preprocessing_data, f)
+    
+    print(f"Model saved to: {model_path}")
+    print(f"Preprocessing saved to: {preprocessing_path}")
+    
+    return model_path, preprocessing_path
 
 
 def load_csv_dataset(
@@ -96,14 +134,54 @@ def load_csv_dataset(
     # Separate numerical and categorical features
     numerical_columns = [col for col in X.columns if col not in categorical_columns]
     
-    X_num = X[numerical_columns].values.astype(np.float32) if numerical_columns else None
+    X_num = None
+    if numerical_columns:
+        X_num_df = X[numerical_columns].copy()
+        
+        # Handle missing and infinite values in numerical features
+        print(f"Checking for missing/infinite values in numerical features...")
+        
+        # Check for missing values
+        missing_counts = X_num_df.isnull().sum()
+        if missing_counts.sum() > 0:
+            print(f"Found missing values in {(missing_counts > 0).sum()} columns")
+            for col in missing_counts[missing_counts > 0].index:
+                print(f"  {col}: {missing_counts[col]} missing values")
+        
+        # Fill missing values with median
+        for col in X_num_df.columns:
+            if X_num_df[col].isnull().any():
+                median_val = X_num_df[col].median()
+                X_num_df[col].fillna(median_val, inplace=True)
+        
+        # Convert to float32
+        X_num_df = X_num_df.astype(np.float32)
+        
+        # Check for infinite values
+        inf_mask = np.isinf(X_num_df.values)
+        if inf_mask.any():
+            print(f"Found {inf_mask.sum()} infinite values, replacing with finite values...")
+            # Replace inf with very large finite values, -inf with very small finite values
+            X_num_df = X_num_df.replace([np.inf, -np.inf], [np.finfo(np.float32).max/2, np.finfo(np.float32).min/2])
+        
+        # Final check for any remaining NaN/inf values
+        final_check = np.isnan(X_num_df.values) | np.isinf(X_num_df.values)
+        if final_check.any():
+            print(f"Warning: Still found {final_check.sum()} NaN/inf values after cleaning")
+            # Replace any remaining problematic values with 0
+            X_num_df = X_num_df.fillna(0)
+            X_num_df = X_num_df.replace([np.inf, -np.inf], 0)
+        
+        X_num = X_num_df.values
+        print(f"Numerical features cleaned: {X_num.shape}")
+    
     X_cat = None
     cat_cardinalities = []
+    label_encoders = {}
     
     if categorical_columns:
         # Encode categorical features
         X_cat_df = X[categorical_columns].copy()
-        label_encoders = {}
         
         for col in categorical_columns:
             le = sklearn.preprocessing.LabelEncoder()
@@ -163,7 +241,19 @@ def load_csv_dataset(
     print(f"Dataset splits - Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
     print(f"Numerical features: {n_num_features}")
     
-    return data_splits, n_num_features, cat_cardinalities, n_classes
+    # Create feature info for inference
+    feature_info = {
+        'numerical_columns': numerical_columns,
+        'categorical_columns': categorical_columns,
+        'cat_cardinalities': cat_cardinalities,
+        'identifier_columns': identifier_columns,
+        'target_column': target_column,
+        'task_type': task_type,
+        'n_classes': n_classes,
+        'label_encoders': label_encoders if categorical_columns else None,
+    }
+    
+    return data_splits, n_num_features, cat_cardinalities, n_classes, feature_info
 
 
 def preprocess_features(data_splits, n_num_features):
@@ -221,14 +311,29 @@ def setup_model_and_training(
             bins = None
             num_embeddings = None
         else:
-            bins = rtdl_num_embeddings.compute_bins(train_x_cont)
-            num_embeddings = {
-                'type': 'PiecewiseLinearEmbeddings',
-                'd_embedding': 16,
-                'activation': False,
-                'version': 'B',
-            }
-            print(f"Using TabM-mini with piecewise-linear embeddings (bins computed from {train_x_cont.shape[0]} training samples)")
+            # Final safety check for NaN/inf values before computing bins
+            if torch.isnan(train_x_cont).any() or torch.isinf(train_x_cont).any():
+                print(f"Warning: Found NaN/inf values in training data after preprocessing.")
+                print(f"Falling back to standard TabM architecture.")
+                arch_type = 'tabm'
+                bins = None
+                num_embeddings = None
+            else:
+                try:
+                    bins = rtdl_num_embeddings.compute_bins(train_x_cont)
+                    num_embeddings = {
+                        'type': 'PiecewiseLinearEmbeddings',
+                        'd_embedding': 16,
+                        'activation': False,
+                        'version': 'B',
+                    }
+                    print(f"Using TabM-mini with piecewise-linear embeddings (bins computed from {train_x_cont.shape[0]} training samples)")
+                except Exception as e:
+                    print(f"Warning: Failed to compute bins for embeddings: {e}")
+                    print(f"Falling back to standard TabM architecture.")
+                    arch_type = 'tabm'
+                    bins = None
+                    num_embeddings = None
     else:
         arch_type = 'tabm'
         print(f"Using standard TabM architecture")
@@ -258,7 +363,27 @@ def setup_model_and_training(
         weight_decay=3e-4
     )
     
-    return model, optimizer
+    # Create model configuration for saving
+    model_config = {
+        'n_num_features': n_num_features,
+        'cat_cardinalities': cat_cardinalities,
+        'n_classes': n_classes,
+        'task_type': task_type,
+        'backbone': {
+            'type': 'MLP',
+            'n_blocks': 2 if use_embeddings else 3,
+            'd_block': 512,
+            'dropout': 0.1,
+        },
+        'bins': bins,
+        'num_embeddings': num_embeddings,
+        'arch_type': arch_type,
+        'k': 32,
+        'share_training_batches': True,
+        'use_embeddings': use_embeddings,
+    }
+    
+    return model, optimizer, model_config
 
 
 def train_model(
@@ -378,6 +503,8 @@ def main():
     parser.add_argument('--n_epochs', type=int, default=1000, help='Maximum number of epochs')
     parser.add_argument('--patience', type=int, default=16, help='Early stopping patience')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--save_dir', type=str, default=None, 
+                       help='Directory to save model and preprocessing (default: auto-generated based on dataset name)')
     
     args = parser.parse_args()
     
@@ -400,7 +527,7 @@ def main():
     
     # Load and preprocess dataset
     print(f'Loading dataset from {args.data_path}...')
-    data_splits, n_num_features, cat_cardinalities, n_classes = load_csv_dataset(
+    data_splits, n_num_features, cat_cardinalities, n_classes, feature_info = load_csv_dataset(
         args.data_path, args.target_column, args.task_type, args.categorical_columns, sep=args.sep
     )
     
@@ -437,7 +564,7 @@ def main():
         Y_train = Y_train.float()
     
     # Setup model and training
-    model, optimizer = setup_model_and_training(
+    model, optimizer, model_config = setup_model_and_training(
         n_num_features, cat_cardinalities, n_classes, args.task_type, device, data_splits, args.use_embeddings
     )
     
@@ -455,6 +582,33 @@ def main():
     print(f'Best validation score: {best_result["val"]:.4f}')
     print(f'Best test score: {best_result["test"]:.4f}')
     print(f'Best epoch: {best_result["epoch"]}')
+    
+    # Save model and preprocessing
+    print('\n' + '-'*80)
+    print('Saving model and preprocessing...')
+    
+    # Create save directory name based on dataset and task
+    if args.save_dir:
+        save_dir = args.save_dir
+    else:
+        dataset_name = Path(args.data_path).stem
+        save_dir = f"saved_model_{dataset_name}_{args.task_type}"
+    
+    model_path, preprocessing_path = save_model_and_preprocessing(
+        model=model,
+        preprocessing_pipeline=preprocessing,
+        regression_label_stats=regression_label_stats,
+        feature_info=feature_info,
+        model_config=model_config,
+        save_dir=save_dir
+    )
+    
+    print(f'\n✅ Training and saving completed!')
+    print(f'📁 Model saved to: {model_path}')
+    print(f'📁 Preprocessing saved to: {preprocessing_path}')
+    print(f'\nTo use for inference, you will need both files:')
+    print(f'  - Model: {model_path}')
+    print(f'  - Preprocessing: {preprocessing_path}')
 
 
 if __name__ == '__main__':
