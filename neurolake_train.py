@@ -5,6 +5,7 @@
 TabM Training Script for Custom CSV Datasets
 
 Uses TabM-mini with piecewise-linear embeddings by default for optimal performance.
+For binary classification, uses KS statistic instead of accuracy for evaluation.
 
 Usage:
     # For comma-separated CSV with hyperparameter tuning
@@ -18,6 +19,11 @@ Requirements:
     - Target column specified
     - Task type: 'regression', 'binclass', or 'multiclass'
     - Automatically excludes identifier columns (cpf, ref_date, etc.)
+    
+Evaluation Metrics:
+    - Regression: Negative RMSE (higher is better)
+    - Binary Classification: KS statistic (higher is better)
+    - Multiclass Classification: Accuracy (higher is better)
 """
 
 import argparse
@@ -555,8 +561,28 @@ def train_model(
         
         if task_type == 'regression':
             score = -(sklearn.metrics.mean_squared_error(y_true, y_pred) ** 0.5)
+        elif task_type == 'binclass':
+            # For binary classification, calculate KS statistic
+            # Get probability of positive class (class 1)
+            y_pred_proba = y_pred[:, 1] if y_pred.ndim > 1 else y_pred
+            
+            # Calculate KS statistic using scipy.stats
+            from scipy import stats
+            
+            # Separate predictions for each class
+            pos_scores = y_pred_proba[y_true == 1]
+            neg_scores = y_pred_proba[y_true == 0]
+            
+            # Calculate KS statistic (Kolmogorov-Smirnov test)
+            if len(pos_scores) > 0 and len(neg_scores) > 0:
+                ks_stat, _ = stats.ks_2samp(pos_scores, neg_scores)
+                score = ks_stat
+            else:
+                # Fallback to accuracy if one class is missing
+                score = sklearn.metrics.accuracy_score(y_true, y_pred.argmax(1) if y_pred.ndim > 1 else (y_pred > 0.5).astype(int))
         else:
-            score = sklearn.metrics.accuracy_score(y_true, y_pred.argmax(1) if task_type != 'regression' else y_pred > 0.5)
+            # For multiclass, keep using accuracy
+            score = sklearn.metrics.accuracy_score(y_true, y_pred.argmax(1))
         
         return float(score)
     
@@ -566,7 +592,15 @@ def train_model(
     remaining_patience = patience
     
     if verbose:
-        print(f'Initial test score: {evaluate("test"):.4f}')
+        # Clarify what the score represents based on task type
+        if task_type == 'regression':
+            metric_name = "Negative RMSE"
+        elif task_type == 'binclass':
+            metric_name = "KS Statistic"
+        else:
+            metric_name = "Accuracy"
+        
+        print(f'Initial test {metric_name}: {evaluate("test"):.4f}')
         print('-' * 80)
     
     for epoch in range(n_epochs):
@@ -692,8 +726,17 @@ def main():
     
     print('\n' + '='*80)
     print('Training completed!')
-    print(f'Best validation score: {best_result["val"]:.4f}')
-    print(f'Best test score: {best_result["test"]:.4f}')
+    
+    # Clarify what the score represents based on task type
+    if args.task_type == 'regression':
+        metric_name = "Negative RMSE"
+    elif args.task_type == 'binclass':
+        metric_name = "KS Statistic"
+    else:
+        metric_name = "Accuracy"
+    
+    print(f'Best validation {metric_name}: {best_result["val"]:.4f}')
+    print(f'Best test {metric_name}: {best_result["test"]:.4f}')
     print(f'Best epoch: {best_result["epoch"]}')
     
     # Save model and preprocessing
