@@ -355,6 +355,22 @@ def _init_first_adapter(
         weight[:, section_bounds[i] : section_bounds[i + 1]] = w
 
 
+# Custom PiecewiseLinearEmbeddings wrapper that supports version parameter
+class PiecewiseLinearEmbeddings(rtdl_num_embeddings.PiecewiseLinearEmbeddings):
+    """
+    This class simply adds the default values for `activation` and `version`.
+    """
+
+    def __init__(
+        self,
+        *args,
+        activation: bool = False,
+        version: None | Literal['A', 'B'] = 'B',
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs, activation=activation, version=version)
+
+
 _CUSTOM_MODULES = {
     # https://docs.python.org/3/library/stdtypes.html#definition.__name__
     CustomModule.__name__: CustomModule
@@ -362,7 +378,7 @@ _CUSTOM_MODULES = {
         rtdl_num_embeddings.LinearEmbeddings,
         rtdl_num_embeddings.LinearReLUEmbeddings,
         rtdl_num_embeddings.PeriodicEmbeddings,
-        rtdl_num_embeddings.PiecewiseLinearEmbeddings,
+        PiecewiseLinearEmbeddings,  # Use our custom wrapper instead of rtdl_num_embeddings.PiecewiseLinearEmbeddings
         MLP,
     ]
 }
