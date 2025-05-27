@@ -7,12 +7,17 @@ TabM Training Script for Custom CSV Datasets
 Uses TabM-mini with piecewise-linear embeddings by default for optimal performance.
 
 Usage:
+    # For comma-separated CSV
     python neurolake_train.py --data_path dataset.csv --target_column target --task_type regression
+    
+    # For tab-separated CSV (like your training file)
+    python neurolake_train.py --data_path train.csv --target_column alvo --task_type binclass --sep "\\t"
 
 Requirements:
-    - CSV file with headers
+    - CSV file with headers (comma or tab separated)
     - Target column specified
     - Task type: 'regression', 'binclass', or 'multiclass'
+    - Automatically excludes identifier columns (cpf, ref_date, etc.)
 """
 
 import argparse
@@ -52,19 +57,35 @@ def load_csv_dataset(
     categorical_columns: Optional[list] = None,
     test_size: float = 0.2,
     val_size: float = 0.2,
-    random_state: int = 42
+    random_state: int = 42,
+    sep: str = ','
 ):
     """Load and preprocess CSV dataset for TabM training."""
     
-    # Load data
-    df = pd.read_csv(data_path)
+    # Load data with specified separator
+    df = pd.read_csv(data_path, sep=sep)
     print(f"Loaded dataset: {df.shape[0]} rows, {df.shape[1]} columns")
     
     # Separate features and target
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' not found in dataset")
     
-    X = df.drop(columns=[target_column])
+    # Identify and exclude identifier columns (common patterns)
+    identifier_patterns = ['cpf', 'id', 'ref_date', 'date', 'timestamp']
+    identifier_columns = []
+    for col in df.columns:
+        if col.lower() != target_column.lower():  # Don't exclude target
+            for pattern in identifier_patterns:
+                if pattern in col.lower():
+                    identifier_columns.append(col)
+                    break
+    
+    if identifier_columns:
+        print(f"Excluding identifier columns: {identifier_columns}")
+        X = df.drop(columns=[target_column] + identifier_columns)
+    else:
+        X = df.drop(columns=[target_column])
+    
     y = df[target_column].values
     
     # Handle categorical columns
@@ -347,6 +368,8 @@ def main():
                        required=True, help='Type of task')
     parser.add_argument('--categorical_columns', type=str, nargs='*', default=None,
                        help='List of categorical column names (auto-detected if not specified)')
+    parser.add_argument('--sep', type=str, default=',',
+                       help='CSV separator (default: comma). Use "\\t" for tab-separated files')
     parser.add_argument('--use_embeddings', action='store_true', default=True,
                        help='Use TabM-mini with piecewise-linear embeddings for numerical features (default: True)')
     parser.add_argument('--no_embeddings', action='store_true', 
@@ -362,6 +385,10 @@ def main():
     if args.no_embeddings:
         args.use_embeddings = False
     
+    # Handle separator (convert \t string to actual tab character)
+    if args.sep == '\\t':
+        args.sep = '\t'
+    
     # Set random seeds
     random.seed(args.seed)
     np.random.seed(args.seed + 1)
@@ -374,7 +401,7 @@ def main():
     # Load and preprocess dataset
     print(f'Loading dataset from {args.data_path}...')
     data_splits, n_num_features, cat_cardinalities, n_classes = load_csv_dataset(
-        args.data_path, args.target_column, args.task_type, args.categorical_columns
+        args.data_path, args.target_column, args.task_type, args.categorical_columns, sep=args.sep
     )
     
     # Preprocess features
