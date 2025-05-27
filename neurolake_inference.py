@@ -11,7 +11,7 @@ Usage:
     # Basic inference
     python neurolake_inference.py --data_path new_data.csv --model_path saved_model/model.pth --preprocessing_path saved_model/preprocessing.pkl --output_path predictions.csv
     
-    # With KS statistics calculation (binary classification only)
+    # With KS statistic calculation (binary classification only, requires target column in data)
     python neurolake_inference.py --data_path new_data.csv --model_path saved_model/model.pth --preprocessing_path saved_model/preprocessing.pkl --output_path predictions.csv --calculate_ks --target_column alvo
 
 Requirements:
@@ -38,13 +38,7 @@ warnings.simplefilter('ignore')
 from tabm_reference import Model
 warnings.resetwarnings()
 
-# Import KS statistics utilities
-try:
-    from ks_utils import calculate_ks_for_dataframe, print_ks_summary
-    KS_UTILS_AVAILABLE = True
-except ImportError:
-    KS_UTILS_AVAILABLE = False
-    print("Warning: ks_utils not available. KS statistics will be skipped.")
+# KS statistic calculation uses scipy.stats (imported in function when needed)
 
 
 def load_model_and_preprocessing(model_path: str, preprocessing_path: str, device: torch.device):
@@ -267,7 +261,8 @@ def calculate_ks_from_inference(
     output_path: str
 ):
     """
-    Calculate KS statistics from inference outputs.
+    Calculate KS statistic from inference outputs using predicted probabilities vs true labels.
+    This matches the KS calculation used during training validation/test.
     
     Args:
         original_df: Original dataframe with features
@@ -276,10 +271,6 @@ def calculate_ks_from_inference(
         feature_info: Feature information from preprocessing
         output_path: Base path for saving KS results
     """
-    if not KS_UTILS_AVAILABLE:
-        print("⚠️  KS statistics calculation skipped (ks_utils not available)")
-        return
-    
     task_type = model_config['task_type']
     target_column = feature_info['target_column']
     
@@ -288,65 +279,114 @@ def calculate_ks_from_inference(
         print(f"⚠️  KS statistics only available for binary classification. Current task: {task_type}")
         return
     
-    # Check if we have predictions to use as pseudo-targets
-    if 'predicted_class' not in predictions_df.columns:
-        print("⚠️  No predicted_class column found for KS calculation")
+    # Check if we have the target column in the original data
+    if target_column not in original_df.columns:
+        print(f"⚠️  Target column '{target_column}' not found in data. Cannot calculate KS statistic.")
+        print(f"Available columns: {list(original_df.columns)}")
         return
     
-    print(f"\n🔄 Calculating KS statistics from inference outputs...")
-    print(f"📊 Using predicted classes as pseudo-targets for KS analysis")
+    # Check if we have probability predictions
+    if 'class_1_probability' not in predictions_df.columns:
+        print("⚠️  No class_1_probability column found for KS calculation")
+        return
     
-    # Create a combined dataframe with original features and predictions
-    analysis_df = original_df.copy()
+    print(f"\n🔄 Calculating KS statistic from inference outputs...")
+    print(f"📊 Using predicted probabilities vs true labels (like training validation)")
     
-    # Use predicted classes as the target for KS analysis
-    analysis_df['predicted_target'] = predictions_df['predicted_class']
+    # Get true labels and predicted probabilities
+    y_true = original_df[target_column].values
+    y_pred_proba = predictions_df['class_1_probability'].values
     
-    # Remove identifier columns for KS analysis
-    identifier_columns = feature_info.get('identifier_columns', ['cpf', 'ref_date', 'id', 'customer_id'])
+    # Convert target to binary if needed (same as training script)
+    unique_targets = pd.Series(y_true).dropna().unique()
+    if len(unique_targets) != 2:
+        print(f"⚠️  Target must be binary. Found {len(unique_targets)} unique values: {unique_targets}")
+        return
+    
+    # Convert to 0/1 if not already
+    if not set(unique_targets).issubset({0, 1}):
+        target_mapping = {unique_targets[0]: 0, unique_targets[1]: 1}
+        y_true = pd.Series(y_true).map(target_mapping).values
+    
+    # Remove any NaN values
+    valid_mask = ~pd.isna(y_true) & ~pd.isna(y_pred_proba)
+    y_true_clean = y_true[valid_mask]
+    y_pred_proba_clean = y_pred_proba[valid_mask]
+    
+    if len(y_true_clean) == 0:
+        print("⚠️  No valid samples for KS calculation")
+        return
     
     try:
-        # Calculate KS statistics using predicted classes as target
-        ks_results = calculate_ks_for_dataframe(
-            analysis_df, 
-            target_column='predicted_target',
-            exclude_columns=identifier_columns
-        )
+        # Calculate KS statistic exactly like in training script
+        from scipy import stats
         
-        # Print summary
-        print_ks_summary(analysis_df, target_column='predicted_target', top_n=15)
+        # Separate predictions for each class
+        pos_scores = y_pred_proba_clean[y_true_clean == 1]
+        neg_scores = y_pred_proba_clean[y_true_clean == 0]
         
-        # Save KS results
-        ks_output_path = output_path.replace('.csv', '_ks_statistics.csv')
-        ks_results.to_csv(ks_output_path, index=False)
-        
-        print(f"\n📊 KS Statistics Analysis:")
-        print(f"   - Total features analyzed: {len(ks_results)}")
-        print(f"   - Features with KS > 0.1: {(ks_results['ks_statistic'] > 0.1).sum()}")
-        print(f"   - Features with KS > 0.2: {(ks_results['ks_statistic'] > 0.2).sum()}")
-        print(f"   - Mean KS statistic: {ks_results['ks_statistic'].mean():.4f}")
-        print(f"   - Max KS statistic: {ks_results['ks_statistic'].max():.4f}")
-        
-        # Show top discriminative features
-        top_features = ks_results.head(5)
-        print(f"\n🏆 Top 5 most discriminative features:")
-        for _, row in top_features.iterrows():
-            print(f"   {row['ks_rank']}. {row['feature']:<25} KS: {row['ks_statistic']:.4f}")
-        
-        print(f"\n💾 KS statistics saved to: {ks_output_path}")
-        
-        # Add KS summary to predictions metadata
-        if hasattr(predictions_df, 'attrs'):
-            predictions_df.attrs['ks_summary'] = {
-                'total_features': len(ks_results),
-                'mean_ks': ks_results['ks_statistic'].mean(),
-                'max_ks': ks_results['ks_statistic'].max(),
-                'top_features': ks_results.head(5)['feature'].tolist(),
-                'high_ks_count': (ks_results['ks_statistic'] > 0.2).sum()
+        # Calculate KS statistic (Kolmogorov-Smirnov test)
+        if len(pos_scores) > 0 and len(neg_scores) > 0:
+            ks_stat, ks_p_value = stats.ks_2samp(pos_scores, neg_scores)
+            
+            print(f"\n📊 KS Statistic Results:")
+            print(f"   - KS Statistic: {ks_stat:.4f}")
+            print(f"   - P-value: {ks_p_value:.2e}")
+            print(f"   - Samples analyzed: {len(y_true_clean)}")
+            print(f"   - Positive class samples: {len(pos_scores)}")
+            print(f"   - Negative class samples: {len(neg_scores)}")
+            
+            # Interpretation
+            if ks_stat > 0.3:
+                interpretation = "Very strong discriminative power"
+            elif ks_stat > 0.2:
+                interpretation = "Strong discriminative power"
+            elif ks_stat > 0.1:
+                interpretation = "Moderate discriminative power"
+            else:
+                interpretation = "Weak discriminative power"
+            
+            print(f"   - Interpretation: {interpretation}")
+            
+            # Additional statistics
+            print(f"\n📈 Additional Statistics:")
+            print(f"   - Mean probability (positive class): {pos_scores.mean():.4f}")
+            print(f"   - Mean probability (negative class): {neg_scores.mean():.4f}")
+            print(f"   - Std probability (positive class): {pos_scores.std():.4f}")
+            print(f"   - Std probability (negative class): {neg_scores.std():.4f}")
+            
+            # Save KS results
+            ks_results = {
+                'ks_statistic': ks_stat,
+                'ks_p_value': ks_p_value,
+                'n_samples': len(y_true_clean),
+                'n_positive': len(pos_scores),
+                'n_negative': len(neg_scores),
+                'mean_prob_positive': pos_scores.mean(),
+                'mean_prob_negative': neg_scores.mean(),
+                'std_prob_positive': pos_scores.std(),
+                'std_prob_negative': neg_scores.std(),
+                'interpretation': interpretation,
+                'target_column': target_column
             }
-        
+            
+            ks_output_path = output_path.replace('.csv', '_ks_statistic.csv')
+            ks_df = pd.DataFrame([ks_results])
+            ks_df.to_csv(ks_output_path, index=False)
+            
+            print(f"\n💾 KS statistic saved to: {ks_output_path}")
+            
+            # Add KS summary to predictions metadata
+            if hasattr(predictions_df, 'attrs'):
+                predictions_df.attrs['ks_statistic'] = ks_stat
+                predictions_df.attrs['ks_p_value'] = ks_p_value
+                predictions_df.attrs['ks_interpretation'] = interpretation
+            
+        else:
+            print("⚠️  Cannot calculate KS statistic: one class is missing")
+            
     except Exception as e:
-        print(f"⚠️  Error calculating KS statistics: {e}")
+        print(f"⚠️  Error calculating KS statistic: {e}")
 
 
 def main():
@@ -359,9 +399,9 @@ def main():
                        help='CSV separator (default: comma). Use "\\t" for tab-separated files')
     parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for inference')
     parser.add_argument('--calculate_ks', action='store_true', 
-                       help='Calculate KS statistics from inference outputs (binary classification only)')
+                       help='Calculate KS statistic between predicted probabilities and true labels (binary classification only)')
     parser.add_argument('--target_column', type=str, default='alvo',
-                       help='Name of target column for KS analysis (default: alvo)')
+                       help='Name of target column in data for KS calculation (default: alvo)')
     
     args = parser.parse_args()
     
