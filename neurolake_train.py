@@ -7,10 +7,10 @@ TabM Training Script for Custom CSV Datasets
 Uses TabM-mini with piecewise-linear embeddings by default for optimal performance.
 
 Usage:
-    # For comma-separated CSV
-    python neurolake_train.py --data_path dataset.csv --target_column target --task_type regression
+    # For comma-separated CSV with hyperparameter tuning
+    python neurolake_train.py --data_path dataset.csv --target_column target --task_type regression --tune_hyperparams
     
-    # For tab-separated CSV (like your training file)
+    # For tab-separated CSV (like your training file) with fixed hyperparams
     python neurolake_train.py --data_path train.csv --target_column alvo --task_type binclass --sep "\\t"
 
 Requirements:
@@ -44,6 +44,13 @@ from tqdm.std import tqdm
 warnings.simplefilter('ignore')
 from tabm_reference import Model, make_parameter_groups
 warnings.resetwarnings()
+
+# Optional Optuna import for hyperparameter tuning
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
 
 
 class RegressionLabelStats(NamedTuple):
@@ -287,9 +294,21 @@ def setup_model_and_training(
     task_type: str,
     device: torch.device,
     data_splits: dict,
-    use_embeddings: bool = False
+    use_embeddings: bool = False,
+    hyperparams: Optional[dict] = None
 ):
     """Setup TabM model and training components."""
+    
+    # Use provided hyperparams or defaults
+    if hyperparams is None:
+        hyperparams = {
+            'n_blocks': 2 if use_embeddings else 3,
+            'd_block': 512,
+            'dropout': 0.1,
+            'lr': 2e-3,
+            'weight_decay': 3e-4,
+            'd_embedding': 16,
+        }
     
     # Configure model architecture
     bins = None
@@ -323,7 +342,7 @@ def setup_model_and_training(
                     bins = rtdl_num_embeddings.compute_bins(train_x_cont)
                     num_embeddings = {
                         'type': 'PiecewiseLinearEmbeddings',
-                        'd_embedding': 16,
+                        'd_embedding': hyperparams['d_embedding'],
                         'activation': False,
                         'version': 'B',
                     }
@@ -345,9 +364,9 @@ def setup_model_and_training(
         n_classes=n_classes,
         backbone={
             'type': 'MLP',
-            'n_blocks': 2 if use_embeddings else 3,
-            'd_block': 512,
-            'dropout': 0.1,
+            'n_blocks': hyperparams['n_blocks'],
+            'd_block': hyperparams['d_block'],
+            'dropout': hyperparams['dropout'],
         },
         bins=bins,
         num_embeddings=num_embeddings,
@@ -359,8 +378,8 @@ def setup_model_and_training(
     # Setup optimizer
     optimizer = torch.optim.AdamW(
         make_parameter_groups(model), 
-        lr=2e-3, 
-        weight_decay=3e-4
+        lr=hyperparams['lr'], 
+        weight_decay=hyperparams['weight_decay']
     )
     
     # Create model configuration for saving
@@ -371,9 +390,9 @@ def setup_model_and_training(
         'task_type': task_type,
         'backbone': {
             'type': 'MLP',
-            'n_blocks': 2 if use_embeddings else 3,
-            'd_block': 512,
-            'dropout': 0.1,
+            'n_blocks': hyperparams['n_blocks'],
+            'd_block': hyperparams['d_block'],
+            'dropout': hyperparams['dropout'],
         },
         'bins': bins,
         'num_embeddings': num_embeddings,
@@ -381,24 +400,117 @@ def setup_model_and_training(
         'k': 32,
         'share_training_batches': True,
         'use_embeddings': use_embeddings,
+        'hyperparams': hyperparams,
     }
     
     return model, optimizer, model_config
 
 
+def tune_hyperparameters(
+    data_splits, n_num_features, cat_cardinalities, n_classes, task_type, 
+    device, use_embeddings, n_trials=50, timeout=3600
+):
+    """Tune hyperparameters using Optuna with TabM paper specifications."""
+    
+    if not OPTUNA_AVAILABLE:
+        print("Optuna not available. Install with: pip install optuna")
+        return None
+    
+    def objective(trial):
+        # Sample hyperparameters according to TabM paper
+        if use_embeddings:
+            # TabM with embeddings ranges
+            n_blocks = trial.suggest_int('n_blocks', 1, 4)
+            lr = trial.suggest_float('lr', 5e-5, 3e-3, log=True)
+            d_embedding = trial.suggest_int('d_embedding', 8, 32)
+        else:
+            # Standard TabM ranges  
+            n_blocks = trial.suggest_int('n_blocks', 1, 5)
+            lr = trial.suggest_float('lr', 1e-4, 5e-3, log=True)
+            d_embedding = 16  # Not used without embeddings
+        
+        d_block = trial.suggest_int('d_block', 64, 1024)
+        dropout = trial.suggest_float('dropout', 0.0, 0.5)
+        
+        # Weight decay: either 0 or log-uniform range (as in paper)
+        if trial.suggest_categorical('use_weight_decay', [True, False]):
+            weight_decay = trial.suggest_float('weight_decay', 1e-4, 1e-1, log=True)
+        else:
+            weight_decay = 0.0
+        
+        hyperparams = {
+            'n_blocks': n_blocks,
+            'd_block': d_block,
+            'dropout': dropout,
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'd_embedding': d_embedding,
+        }
+        
+        try:
+            # Setup model with these hyperparams
+            model, optimizer, _ = setup_model_and_training(
+                n_num_features, cat_cardinalities, n_classes, task_type, 
+                device, data_splits, use_embeddings, hyperparams
+            )
+            
+            # Quick training (reduced epochs for tuning)
+            best_result = train_model(
+                model, optimizer, data_splits, task_type, device,
+                n_epochs=100, patience=8, batch_size=256, verbose=False
+            )
+            
+            return best_result['val']
+            
+        except Exception as e:
+            print(f"Trial failed: {e}")
+            return float('-inf')
+    
+    print(f"Starting hyperparameter tuning with {n_trials} trials...")
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    
+    print(f"Best validation score: {study.best_value:.4f}")
+    print(f"Best hyperparameters: {study.best_params}")
+    
+    # Convert best params to our format
+    best_params = study.best_params.copy()
+    if not best_params.get('use_weight_decay', True):
+        best_params['weight_decay'] = 0.0
+    best_params.pop('use_weight_decay', None)
+    
+    return best_params
+
+
 def train_model(
-    model,
-    optimizer,
-    data,
-    Y_train,
-    task_type: str,
-    regression_label_stats: Optional[RegressionLabelStats],
-    device: torch.device,
-    n_epochs: int = 1000,
-    patience: int = 16,
-    batch_size: int = 256
+    model, optimizer, data_splits, task_type, device,
+    n_epochs: int = 1000, patience: int = 16, batch_size: int = 256, verbose: bool = True
 ):
     """Train the TabM model."""
+    
+    # Handle label preprocessing for regression
+    regression_label_stats = None
+    Y_train = data_splits['train']['y'].copy()
+    
+    if task_type == 'regression':
+        regression_label_stats = RegressionLabelStats(
+            Y_train.mean().item(), Y_train.std().item()
+        )
+        Y_train = (Y_train - regression_label_stats.mean) / regression_label_stats.std
+    
+    # Convert to tensors
+    data = {}
+    for split in data_splits:
+        data[split] = {}
+        for key, value in data_splits[split].items():
+            data[split][key] = torch.as_tensor(value, device=device)
+        
+        if task_type == 'regression':
+            data[split]['y'] = data[split]['y'].float()
+    
+    Y_train = torch.as_tensor(Y_train, device=device)
+    if task_type == 'regression':
+        Y_train = Y_train.float()
     
     @torch.autocast(device.type, enabled=False)
     def apply_model(part: str, idx: Tensor) -> Tensor:
@@ -450,15 +562,16 @@ def train_model(
     best = {'val': -math.inf, 'test': -math.inf, 'epoch': -1}
     remaining_patience = patience
     
-    print(f'Initial test score: {evaluate("test"):.4f}')
-    print('-' * 80)
+    if verbose:
+        print(f'Initial test score: {evaluate("test"):.4f}')
+        print('-' * 80)
     
     for epoch in range(n_epochs):
         # Create batches
         batches = torch.randperm(train_size, device=device).split(batch_size)
         
         # Training step
-        for batch_idx in tqdm(batches, desc=f'Epoch {epoch}'):
+        for batch_idx in (tqdm(batches, desc=f'Epoch {epoch}') if verbose else batches):
             model.train()
             optimizer.zero_grad()
             loss = loss_fn(apply_model('train', batch_idx), Y_train[batch_idx])
@@ -468,18 +581,22 @@ def train_model(
         # Evaluation
         val_score = evaluate('val')
         test_score = evaluate('test')
-        print(f'Epoch {epoch}: (val) {val_score:.4f} (test) {test_score:.4f}')
+        
+        if verbose:
+            print(f'Epoch {epoch}: (val) {val_score:.4f} (test) {test_score:.4f}')
         
         # Early stopping
         if val_score > best['val']:
-            print('🌸 New best epoch! 🌸')
+            if verbose:
+                print('🌸 New best epoch! 🌸')
             best = {'val': val_score, 'test': test_score, 'epoch': epoch}
             remaining_patience = patience
         else:
             remaining_patience -= 1
         
         if remaining_patience < 0:
-            print(f'Early stopping at epoch {epoch}')
+            if verbose:
+                print(f'Early stopping at epoch {epoch}')
             break
     
     return best
@@ -499,6 +616,10 @@ def main():
                        help='Use TabM-mini with piecewise-linear embeddings for numerical features (default: True)')
     parser.add_argument('--no_embeddings', action='store_true', 
                        help='Use standard TabM instead of TabM-mini with embeddings')
+    parser.add_argument('--tune_hyperparams', action='store_true',
+                       help='Enable hyperparameter tuning with Optuna (requires: pip install optuna)')
+    parser.add_argument('--n_trials', type=int, default=50,
+                       help='Number of hyperparameter tuning trials (default: 50)')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
     parser.add_argument('--n_epochs', type=int, default=1000, help='Maximum number of epochs')
     parser.add_argument('--patience', type=int, default=16, help='Early stopping patience')
@@ -539,41 +660,30 @@ def main():
         print("Warning: --use_embeddings specified but no numerical features found. Using standard TabM.")
         args.use_embeddings = False
     
-    # Handle label preprocessing for regression
-    regression_label_stats = None
-    Y_train = data_splits['train']['y'].copy()
-    
-    if args.task_type == 'regression':
-        regression_label_stats = RegressionLabelStats(
-            Y_train.mean().item(), Y_train.std().item()
+    # Hyperparameter tuning or use defaults
+    hyperparams = None
+    if args.tune_hyperparams:
+        hyperparams = tune_hyperparameters(
+            data_splits, n_num_features, cat_cardinalities, n_classes, 
+            args.task_type, device, args.use_embeddings, args.n_trials
         )
-        Y_train = (Y_train - regression_label_stats.mean) / regression_label_stats.std
-    
-    # Convert to tensors
-    data = {}
-    for split in data_splits:
-        data[split] = {}
-        for key, value in data_splits[split].items():
-            data[split][key] = torch.as_tensor(value, device=device)
-        
-        if args.task_type == 'regression':
-            data[split]['y'] = data[split]['y'].float()
-    
-    Y_train = torch.as_tensor(Y_train, device=device)
-    if args.task_type == 'regression':
-        Y_train = Y_train.float()
+        if hyperparams is None:
+            print("Hyperparameter tuning failed, using default parameters")
     
     # Setup model and training
     model, optimizer, model_config = setup_model_and_training(
-        n_num_features, cat_cardinalities, n_classes, args.task_type, device, data_splits, args.use_embeddings
+        n_num_features, cat_cardinalities, n_classes, args.task_type, 
+        device, data_splits, args.use_embeddings, hyperparams
     )
     
     print(f'Model created with {sum(p.numel() for p in model.parameters())} parameters')
     print(f'Architecture: {"TabM-mini with piecewise-linear embeddings" if model.arch_type == "tabm-mini" and model.num_module is not None else "Standard TabM"}')
+    if hyperparams:
+        print(f'Tuned hyperparameters: {hyperparams}')
     
     # Train model
     best_result = train_model(
-        model, optimizer, data, Y_train, args.task_type, regression_label_stats, device,
+        model, optimizer, data_splits, args.task_type, device,
         args.n_epochs, args.patience, args.batch_size
     )
     
@@ -593,6 +703,14 @@ def main():
     else:
         dataset_name = Path(args.data_path).stem
         save_dir = f"saved_model_{dataset_name}_{args.task_type}"
+    
+    # Handle regression label stats for saving
+    regression_label_stats = None
+    if args.task_type == 'regression':
+        Y_train = data_splits['train']['y']
+        regression_label_stats = RegressionLabelStats(
+            Y_train.mean().item(), Y_train.std().item()
+        )
     
     model_path, preprocessing_path = save_model_and_preprocessing(
         model=model,
