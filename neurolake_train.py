@@ -454,10 +454,10 @@ def tune_hyperparameters(
                 device, data_splits, use_embeddings, hyperparams
             )
             
-            # Quick training (reduced epochs for tuning)
+            # Longer training for better hyperparameter evaluation
             best_result = train_model(
                 model, optimizer, data_splits, task_type, device,
-                n_epochs=100, patience=8, batch_size=256, verbose=False
+                n_epochs=1000, patience=50, batch_size=256, verbose=False
             )
             
             return best_result['val']
@@ -484,7 +484,7 @@ def tune_hyperparameters(
 
 def train_model(
     model, optimizer, data_splits, task_type, device,
-    n_epochs: int = 1000, patience: int = 16, batch_size: int = 256, verbose: bool = True
+    n_epochs: int = 10000, patience: int = 1000, batch_size: int = 256, verbose: bool = True
 ):
     """Train the TabM model."""
     
@@ -621,8 +621,8 @@ def main():
     parser.add_argument('--n_trials', type=int, default=50,
                        help='Number of hyperparameter tuning trials (default: 50)')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
-    parser.add_argument('--n_epochs', type=int, default=1000, help='Maximum number of epochs')
-    parser.add_argument('--patience', type=int, default=16, help='Early stopping patience')
+    parser.add_argument('--n_epochs', type=int, default=10000, help='Maximum number of epochs')
+    parser.add_argument('--patience', type=int, default=1000, help='Early stopping patience')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--save_dir', type=str, default=None, 
                        help='Directory to save model and preprocessing (default: auto-generated based on dataset name)')
