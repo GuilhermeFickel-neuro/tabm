@@ -210,7 +210,7 @@ def make_predictions(
     
     n_samples = X_num.shape[0] if X_num is not None else X_cat.shape[0]
     task_type = model_config['task_type']
-    regression_label_stats = preprocessing_data['regression_label_stats']
+    regression_label_stats = preprocessing_data.get('regression_label_stats', None)
     
     # Convert to tensors
     X_num_tensor = torch.as_tensor(X_num, device=device) if X_num is not None else None
