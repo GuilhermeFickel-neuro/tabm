@@ -304,7 +304,7 @@ def preprocess_features(data_splits, n_num_features):
     """Preprocess numerical features using quantile transformation."""
     
     if n_num_features == 0:
-        return data_splits, None
+        return data_splits, None, n_num_features
     
     # Advanced preprocessing with quantile transformation
     X_train = data_splits['train']['x_cont']
@@ -321,7 +321,39 @@ def preprocess_features(data_splits, n_num_features):
         if 'x_cont' in data_splits[split]:
             data_splits[split]['x_cont'] = preprocessing.transform(data_splits[split]['x_cont'])
     
-    return data_splits, preprocessing
+    # Check for constant features after preprocessing
+    X_train_processed = data_splits['train']['x_cont']
+    constant_feature_indices = []
+    
+    for i in range(X_train_processed.shape[1]):
+        feature_values = X_train_processed[:, i]
+        # Check if all values are the same (within a small tolerance for floating point)
+        if np.allclose(feature_values, feature_values[0], rtol=1e-10, atol=1e-10):
+            constant_feature_indices.append(i)
+    
+    if constant_feature_indices:
+        print(f"Removing {len(constant_feature_indices)} numerical features that became constant after preprocessing")
+        
+        # Create mask for features to keep
+        keep_indices = [i for i in range(X_train_processed.shape[1]) if i not in constant_feature_indices]
+        
+        if len(keep_indices) == 0:
+            # All features became constant
+            print("Warning: All numerical features became constant after preprocessing")
+            for split in data_splits:
+                if 'x_cont' in data_splits[split]:
+                    del data_splits[split]['x_cont']
+            return data_splits, preprocessing, 0
+        
+        # Filter out constant features from all splits
+        for split in data_splits:
+            if 'x_cont' in data_splits[split]:
+                data_splits[split]['x_cont'] = data_splits[split]['x_cont'][:, keep_indices]
+        
+        n_num_features = len(keep_indices)
+        print(f"Numerical features after preprocessing: {n_num_features}")
+    
+    return data_splits, preprocessing, n_num_features
 
 
 def setup_model_and_training(
@@ -718,7 +750,7 @@ def main():
     )
     
     # Preprocess features
-    data_splits, preprocessing = preprocess_features(data_splits, n_num_features)
+    data_splits, preprocessing, n_num_features = preprocess_features(data_splits, n_num_features)
     
     # Validate embeddings usage
     if args.use_embeddings and n_num_features == 0:
