@@ -8,6 +8,12 @@ Trains and evaluates baseline models (XGBoost, CatBoost, LightGBM) with Optuna h
 Uses the same data loading and preprocessing as neurolake_train.py and neurolake_inference.py.
 Evaluates using KS statistic for binary classification.
 
+Methodology:
+- Splits training data into train/validation (80/20)
+- Uses validation set for hyperparameter tuning
+- Retrains best model on train+validation
+- Evaluates final model once on test set
+
 Usage:
     # For tab-separated CSV (default)
     python neurolake_baseline.py --train_path train.csv --test_path test.csv --target_column target_value
@@ -33,6 +39,7 @@ import numpy as np
 import pandas as pd
 import sklearn.metrics
 import sklearn.preprocessing
+from sklearn.model_selection import train_test_split
 from scipy import stats
 
 # Suppress warnings
@@ -49,9 +56,11 @@ def load_and_preprocess_data(
     train_path: str,
     test_path: str,
     target_column: str,
-    sep: str = '\t'
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    """Load and preprocess train and test datasets."""
+    sep: str = '\t',
+    validation_size: float = 0.2,
+    random_state: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Load and preprocess train and test datasets, splitting train into train/validation."""
     
     # Load datasets
     train_df = pd.read_csv(train_path, sep=sep)
@@ -65,6 +74,20 @@ def load_and_preprocess_data(
         raise ValueError(f"Target column '{target_column}' not found in train dataset")
     if target_column not in test_df.columns:
         raise ValueError(f"Target column '{target_column}' not found in test dataset")
+    
+    # Split training data into train/validation
+    train_indices, val_indices = train_test_split(
+        range(len(train_df)), 
+        test_size=validation_size, 
+        random_state=random_state,
+        stratify=train_df[target_column]
+    )
+    
+    train_split_df = train_df.iloc[train_indices].copy()
+    val_df = train_df.iloc[val_indices].copy()
+    
+    print(f"Train split: {len(train_split_df)} rows")
+    print(f"Validation split: {len(val_df)} rows")
     
     # Identify and exclude identifier columns (same logic as neurolake_train.py)
     identifier_patterns = ['ref_date', 'date', 'timestamp']
@@ -81,21 +104,25 @@ def load_and_preprocess_data(
     
     if identifier_columns:
         print(f"Excluding identifier columns: {identifier_columns}")
-        X_train = train_df.drop(columns=[target_column] + identifier_columns)
+        X_train = train_split_df.drop(columns=[target_column] + identifier_columns)
+        X_val = val_df.drop(columns=[target_column] + identifier_columns)
         X_test = test_df.drop(columns=[target_column] + identifier_columns)
     else:
-        X_train = train_df.drop(columns=[target_column])
+        X_train = train_split_df.drop(columns=[target_column])
+        X_val = val_df.drop(columns=[target_column])
         X_test = test_df.drop(columns=[target_column])
     
-    y_train = train_df[target_column].values
+    y_train = train_split_df[target_column].values
+    y_val = val_df[target_column].values
     y_test = test_df[target_column].values
     
-    # Ensure both datasets have the same columns
-    common_columns = list(set(X_train.columns) & set(X_test.columns))
+    # Ensure all datasets have the same columns
+    common_columns = list(set(X_train.columns) & set(X_val.columns) & set(X_test.columns))
     if len(common_columns) != len(X_train.columns) or len(common_columns) != len(X_test.columns):
-        print(f"Warning: Train and test datasets have different columns. Using common columns only.")
-        print(f"Train columns: {len(X_train.columns)}, Test columns: {len(X_test.columns)}, Common: {len(common_columns)}")
+        print(f"Warning: Datasets have different columns. Using common columns only.")
+        print(f"Train columns: {len(X_train.columns)}, Val columns: {len(X_val.columns)}, Test columns: {len(X_test.columns)}, Common: {len(common_columns)}")
         X_train = X_train[common_columns]
+        X_val = X_val[common_columns]
         X_test = X_test[common_columns]
     
     # Auto-detect categorical columns (object/string types) - EXACT MATCH to neurolake_train.py
@@ -106,9 +133,12 @@ def load_and_preprocess_data(
     print(f"Numerical columns: {len(numerical_columns)}")
     
     # Process numerical features - EXACT MATCH to neurolake_train.py
-    X_num = None
+    X_num_train = None
+    X_num_val = None
+    X_num_test = None
     if numerical_columns:
         X_train_num = X_train[numerical_columns].copy()
+        X_val_num = X_val[numerical_columns].copy()
         X_test_num = X_test[numerical_columns].copy()
         
         # Handle missing and infinite values in numerical features
@@ -121,43 +151,35 @@ def load_and_preprocess_data(
             for col in missing_counts[missing_counts > 0].index:
                 print(f"  {col}: {missing_counts[col]} missing values")
         
-        # Fill missing values with median (using train median for both train and test)
+        # Fill missing values with median (using train median for all splits)
         for col in X_train_num.columns:
+            median_val = X_train_num[col].median()
             if X_train_num[col].isnull().any():
-                median_val = X_train_num[col].median()
                 X_train_num[col].fillna(median_val, inplace=True)
-                X_test_num[col].fillna(median_val, inplace=True)
-            elif X_test_num[col].isnull().any():
-                median_val = X_train_num[col].median()
+            if X_val_num[col].isnull().any():
+                X_val_num[col].fillna(median_val, inplace=True)
+            if X_test_num[col].isnull().any():
                 X_test_num[col].fillna(median_val, inplace=True)
         
         # Convert to float32
         X_train_num = X_train_num.astype(np.float32)
+        X_val_num = X_val_num.astype(np.float32)
         X_test_num = X_test_num.astype(np.float32)
         
         # Check for infinite values
-        inf_mask = np.isinf(X_train_num.values)
-        if inf_mask.any():
-            print(f"Found {inf_mask.sum()} infinite values in train, replacing with finite values...")
-            X_train_num = X_train_num.replace([np.inf, -np.inf], [np.finfo(np.float32).max/2, np.finfo(np.float32).min/2])
-        
-        inf_mask_test = np.isinf(X_test_num.values)
-        if inf_mask_test.any():
-            print(f"Found {inf_mask_test.sum()} infinite values in test, replacing with finite values...")
-            X_test_num = X_test_num.replace([np.inf, -np.inf], [np.finfo(np.float32).max/2, np.finfo(np.float32).min/2])
+        for df_name, df in [("train", X_train_num), ("val", X_val_num), ("test", X_test_num)]:
+            inf_mask = np.isinf(df.values)
+            if inf_mask.any():
+                print(f"Found {inf_mask.sum()} infinite values in {df_name}, replacing with finite values...")
+                df.replace([np.inf, -np.inf], [np.finfo(np.float32).max/2, np.finfo(np.float32).min/2], inplace=True)
         
         # Final check for any remaining NaN/inf values
-        final_check_train = np.isnan(X_train_num.values) | np.isinf(X_train_num.values)
-        if final_check_train.any():
-            print(f"Warning: Still found {final_check_train.sum()} NaN/inf values in train after cleaning")
-            X_train_num = X_train_num.fillna(0)
-            X_train_num = X_train_num.replace([np.inf, -np.inf], 0)
-        
-        final_check_test = np.isnan(X_test_num.values) | np.isinf(X_test_num.values)
-        if final_check_test.any():
-            print(f"Warning: Still found {final_check_test.sum()} NaN/inf values in test after cleaning")
-            X_test_num = X_test_num.fillna(0)
-            X_test_num = X_test_num.replace([np.inf, -np.inf], 0)
+        for df_name, df in [("train", X_train_num), ("val", X_val_num), ("test", X_test_num)]:
+            final_check = np.isnan(df.values) | np.isinf(df.values)
+            if final_check.any():
+                print(f"Warning: Still found {final_check.sum()} NaN/inf values in {df_name} after cleaning")
+                df.fillna(0, inplace=True)
+                df.replace([np.inf, -np.inf], 0, inplace=True)
         
         # Filter out numerical features with only one unique value (based on train data)
         constant_features = []
@@ -168,18 +190,18 @@ def load_and_preprocess_data(
         if constant_features:
             print(f"Removing {len(constant_features)} numerical features with constant values")
             X_train_num = X_train_num.drop(columns=constant_features)
+            X_val_num = X_val_num.drop(columns=constant_features)
             X_test_num = X_test_num.drop(columns=constant_features)
             numerical_columns = [col for col in numerical_columns if col not in constant_features]
         
         X_num_train = X_train_num.values if len(X_train_num.columns) > 0 else None
+        X_num_val = X_val_num.values if len(X_val_num.columns) > 0 else None
         X_num_test = X_test_num.values if len(X_test_num.columns) > 0 else None
         print(f"Numerical features cleaned: {X_num_train.shape if X_num_train is not None else 'None'}")
-    else:
-        X_num_train = None
-        X_num_test = None
     
     # Process categorical features - EXACT MATCH to neurolake_train.py
     X_cat_train = None
+    X_cat_val = None
     X_cat_test = None
     cat_cardinalities = []
     label_encoders = {}
@@ -187,6 +209,7 @@ def load_and_preprocess_data(
     if categorical_columns:
         # Encode categorical features
         X_train_cat = X_train[categorical_columns].copy()
+        X_val_cat = X_val[categorical_columns].copy()
         X_test_cat = X_test[categorical_columns].copy()
         
         for col in categorical_columns:
@@ -194,17 +217,18 @@ def load_and_preprocess_data(
             # Fit only on train data (like neurolake_train.py)
             X_train_cat[col] = le.fit_transform(X_train_cat[col].astype(str))
             
-            # Transform test data, handling unseen categories
-            test_values = X_test_cat[col].astype(str)
-            # Map unseen categories to a new label (len(classes))
-            test_encoded = []
-            for val in test_values:
-                if val in le.classes_:
-                    test_encoded.append(le.transform([val])[0])
-                else:
-                    # Assign unseen categories to class 0 (or could be len(le.classes_))
-                    test_encoded.append(0)
-            X_test_cat[col] = test_encoded
+            # Transform validation and test data, handling unseen categories
+            for split_name, split_data in [("val", X_val_cat), ("test", X_test_cat)]:
+                split_values = split_data[col].astype(str)
+                # Map unseen categories to a new label (len(classes))
+                split_encoded = []
+                for val in split_values:
+                    if val in le.classes_:
+                        split_encoded.append(le.transform([val])[0])
+                    else:
+                        # Assign unseen categories to class 0 (or could be len(le.classes_))
+                        split_encoded.append(0)
+                split_data[col] = split_encoded
             
             label_encoders[col] = le
             cat_cardinalities.append(len(le.classes_))
@@ -222,12 +246,14 @@ def load_and_preprocess_data(
             
             # Update the data
             X_train_cat = X_train_cat[filtered_categorical_columns]
+            X_val_cat = X_val_cat[filtered_categorical_columns]
             X_test_cat = X_test_cat[filtered_categorical_columns]
             categorical_columns = filtered_categorical_columns
             cat_cardinalities = filtered_cat_cardinalities
             label_encoders = filtered_label_encoders
         
         X_cat_train = X_train_cat.values.astype(np.int64) if len(categorical_columns) > 0 else None
+        X_cat_val = X_val_cat.values.astype(np.int64) if len(categorical_columns) > 0 else None
         X_cat_test = X_test_cat.values.astype(np.int64) if len(categorical_columns) > 0 else None
         print(f"Categorical features: {len(categorical_columns)}, cardinalities: {cat_cardinalities}")
     
@@ -243,6 +269,7 @@ def load_and_preprocess_data(
         )
         
         X_num_train_scaled = scaler.fit_transform(X_num_train + noise)
+        X_num_val_scaled = scaler.transform(X_num_val)
         X_num_test_scaled = scaler.transform(X_num_test)
         
         # Check for constant features after scaling (EXACT MATCH to neurolake_train.py)
@@ -263,39 +290,42 @@ def load_and_preprocess_data(
                 # All features became constant
                 print("Warning: All numerical features became constant after preprocessing")
                 X_num_train_scaled = None
+                X_num_val_scaled = None
                 X_num_test_scaled = None
                 numerical_columns = []
             else:
                 # Filter out constant features
                 X_num_train_scaled = X_num_train_scaled[:, keep_indices]
+                X_num_val_scaled = X_num_val_scaled[:, keep_indices]
                 X_num_test_scaled = X_num_test_scaled[:, keep_indices]
                 numerical_columns = [numerical_columns[i] for i in keep_indices]
                 print(f"Numerical features after preprocessing: {len(keep_indices)}")
     else:
         X_num_train_scaled = None
+        X_num_val_scaled = None
         X_num_test_scaled = None
     
-    # Combine numerical and categorical features
-    X_train_combined = []
-    X_test_combined = []
+    # Combine numerical and categorical features for each split
+    def combine_features(X_num, X_cat):
+        combined = []
+        if X_num is not None:
+            combined.append(X_num)
+        if X_cat is not None:
+            combined.append(X_cat.astype(np.float32))  # Convert to float32 for consistency
+        
+        if combined:
+            return np.concatenate(combined, axis=1)
+        else:
+            raise ValueError("No features remaining after preprocessing")
     
-    if X_num_train_scaled is not None:
-        X_train_combined.append(X_num_train_scaled)
-        X_test_combined.append(X_num_test_scaled)
-    
-    if X_cat_train is not None:
-        X_train_combined.append(X_cat_train.astype(np.float32))  # Convert to float32 for consistency
-        X_test_combined.append(X_cat_test.astype(np.float32))
-    
-    if X_train_combined:
-        X_train_final = np.concatenate(X_train_combined, axis=1)
-        X_test_final = np.concatenate(X_test_combined, axis=1)
-    else:
-        raise ValueError("No features remaining after preprocessing")
+    X_train_final = combine_features(X_num_train_scaled, X_cat_train)
+    X_val_final = combine_features(X_num_val_scaled, X_cat_val)
+    X_test_final = combine_features(X_num_test_scaled, X_cat_test)
     
     # Process target variable for binary classification (EXACT MATCH to neurolake_train.py)
     le_target = sklearn.preprocessing.LabelEncoder()
     y_train_encoded = le_target.fit_transform(y_train).astype(np.int64)
+    y_val_encoded = le_target.transform(y_val).astype(np.int64)
     y_test_encoded = le_target.transform(y_test).astype(np.int64)
     
     print(f"Final feature matrix: {X_train_final.shape[1]} features")
@@ -312,7 +342,7 @@ def load_and_preprocess_data(
         'n_features': X_train_final.shape[1]
     }
     
-    return X_train_final, X_test_final, y_train_encoded, y_test_encoded, feature_info
+    return X_train_final, X_val_final, X_test_final, y_train_encoded, y_val_encoded, y_test_encoded, feature_info
 
 
 def calculate_ks_statistic(y_true: np.ndarray, y_pred_proba: np.ndarray) -> float:
@@ -338,12 +368,14 @@ def tune_and_train_model(
     model_config: Dict[str, Any],
     X_train: np.ndarray,
     y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     X_test: np.ndarray,
     y_test: np.ndarray,
     categorical_features: list = None,
     n_trials: int = 100
 ) -> Dict[str, Any]:
-    """Tune hyperparameters and train a model using Optuna."""
+    """Tune hyperparameters using validation set, then retrain on train+val and evaluate on test."""
     
     model_class = model_config['class']
     base_params = model_config['base_params']
@@ -364,7 +396,7 @@ def tune_and_train_model(
                 params[param_name] = trial.suggest_categorical(param_name, param_args[0])
         
         try:
-            # Create and train model
+            # Create and train model on training set only
             if model_name == 'catboost' and categorical_features:
                 # CatBoost can handle categorical features directly
                 model = model_class(**params, cat_features=categorical_features)
@@ -373,11 +405,11 @@ def tune_and_train_model(
             
             model.fit(X_train, y_train)
             
-            # Predict probabilities
-            y_pred_proba = model.predict_proba(X_test)
+            # Evaluate on validation set
+            y_val_pred_proba = model.predict_proba(X_val)
             
-            # Calculate KS statistic
-            ks_score = calculate_ks_statistic(y_test, y_pred_proba)
+            # Calculate KS statistic on validation set
+            ks_score = calculate_ks_statistic(y_val, y_val_pred_proba)
             
             return ks_score
             
@@ -385,31 +417,38 @@ def tune_and_train_model(
             print(f"Trial failed for {model_name}: {e}")
             return 0.0
     
-    print(f"Tuning {model_name} with {n_trials} trials...")
+    print(f"Tuning {model_name} with {n_trials} trials on validation set...")
     
-    # Create study and optimize
+    # Create study and optimize using validation set
     study = optuna.create_study(direction='maximize')
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     
-    # Train final model with best parameters
+    # Get best parameters from validation tuning
     best_params = {**base_params, **study.best_params}
+    print(f"Best validation KS: {study.best_value:.4f}")
+    print(f"Best parameters: {study.best_params}")
+    
+    # Retrain final model on train + validation data
+    print(f"Retraining {model_name} on train+validation data...")
+    X_train_val = np.concatenate([X_train, X_val], axis=0)
+    y_train_val = np.concatenate([y_train, y_val], axis=0)
     
     if model_name == 'catboost' and categorical_features:
         final_model = model_class(**best_params, cat_features=categorical_features)
     else:
         final_model = model_class(**best_params)
     
-    final_model.fit(X_train, y_train)
+    final_model.fit(X_train_val, y_train_val)
     
-    # Final predictions
-    y_pred_proba = final_model.predict_proba(X_test)
-    final_ks = calculate_ks_statistic(y_test, y_pred_proba)
+    # Final evaluation on test set (only done once!)
+    y_test_pred_proba = final_model.predict_proba(X_test)
+    final_test_ks = calculate_ks_statistic(y_test, y_test_pred_proba)
     
     return {
         'model': final_model,
         'best_params': best_params,
-        'best_trial_score': study.best_value,
-        'final_ks': final_ks,
+        'best_validation_ks': study.best_value,
+        'final_test_ks': final_test_ks,
         'study': study
     }
 
@@ -423,6 +462,8 @@ def main():
                        help='CSV separator (default: tab). Use "," for comma-separated files')
     parser.add_argument('--n_trials', type=int, default=100,
                        help='Number of hyperparameter tuning trials (default: 100)')
+    parser.add_argument('--validation_size', type=float, default=0.2,
+                       help='Fraction of training data to use for validation (default: 0.2)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
     args = parser.parse_args()
@@ -440,14 +481,16 @@ def main():
     print(f'Test: {args.test_path}')
     print(f'Target column: {args.target_column}')
     print(f'Separator: {repr(args.sep)}')
+    print(f'Validation size: {args.validation_size}')
     print('-' * 80)
     
-    X_train, X_test, y_train, y_test, feature_info = load_and_preprocess_data(
-        args.train_path, args.test_path, args.target_column, args.sep
+    X_train, X_val, X_test, y_train, y_val, y_test, feature_info = load_and_preprocess_data(
+        args.train_path, args.test_path, args.target_column, args.sep, args.validation_size, args.seed
     )
     
     print(f'Preprocessing completed!')
     print(f'Train set: {X_train.shape}')
+    print(f'Validation set: {X_val.shape}')
     print(f'Test set: {X_test.shape}')
     print(f'Features: {feature_info["n_features"]}')
     print('=' * 80)
@@ -517,6 +560,8 @@ def main():
                 model_config=model_config,
                 X_train=X_train,
                 y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
                 X_test=X_test,
                 y_test=y_test,
                 categorical_features=categorical_features if model_name == 'catboost' else None,
@@ -525,9 +570,8 @@ def main():
             
             results[model_name] = result
             
-            print(f'Best trial KS: {result["best_trial_score"]:.4f}')
-            print(f'Final test KS: {result["final_ks"]:.4f}')
-            print(f'Best parameters: {result["best_params"]}')
+            print(f'Best validation KS: {result["best_validation_ks"]:.4f}')
+            print(f'Final test KS: {result["final_test_ks"]:.4f}')
             
         except Exception as e:
             print(f'Failed to train {model_name}: {e}')
@@ -539,22 +583,27 @@ def main():
     print('=' * 80)
     
     if results:
-        # Sort by final KS score
-        sorted_results = sorted(results.items(), key=lambda x: x[1]['final_ks'], reverse=True)
+        # Sort by final test KS score
+        sorted_results = sorted(results.items(), key=lambda x: x[1]['final_test_ks'], reverse=True)
         
-        print(f'{"Model":<12} {"Test KS":<10} {"Best Trial KS":<15}')
+        print(f'{"Model":<12} {"Validation KS":<15} {"Test KS":<10}')
         print('-' * 40)
         
         for model_name, result in sorted_results:
-            print(f'{model_name.upper():<12} {result["final_ks"]:<10.4f} {result["best_trial_score"]:<15.4f}')
+            print(f'{model_name.upper():<12} {result["best_validation_ks"]:<15.4f} {result["final_test_ks"]:<10.4f}')
         
         best_model_name, best_result = sorted_results[0]
-        print(f'\n🏆 Best model: {best_model_name.upper()} with KS = {best_result["final_ks"]:.4f}')
+        print(f'\n🏆 Best model: {best_model_name.upper()} with Test KS = {best_result["final_test_ks"]:.4f}')
+        print(f'   (Validation KS was {best_result["best_validation_ks"]:.4f})')
         
     else:
         print('No models were successfully trained.')
     
     print('\n✅ Baseline evaluation completed!')
+    print('\nMethodology:')
+    print('- Used validation set for hyperparameter tuning')
+    print('- Retrained best models on train+validation')
+    print('- Evaluated final models once on test set')
 
 
 if __name__ == '__main__':
