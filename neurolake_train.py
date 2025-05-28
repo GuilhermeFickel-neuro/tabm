@@ -2,28 +2,25 @@
 # coding: utf-8
 
 """
-TabM Training Script for Custom CSV Datasets
+TabM Training Script for Binary Classification with Piecewise-Linear Embeddings
 
-Uses TabM-mini with piecewise-linear embeddings by default for optimal performance.
-For binary classification, uses KS statistic instead of accuracy for evaluation.
+Uses TabM-mini with piecewise-linear embeddings for optimal binary classification performance.
+Uses KS statistic for evaluation.
 
 Usage:
-    # For comma-separated CSV with hyperparameter tuning
-    python neurolake_train.py --data_path dataset.csv --target_column target --task_type regression --tune_hyperparams
+    # For tab-separated CSV (default)
+    python neurolake_train.py --data_path train.csv --target_column alvo --tune_hyperparams
     
-    # For tab-separated CSV (like your training file) with fixed hyperparams
-    python neurolake_train.py --data_path train.csv --target_column alvo --task_type binclass --sep "\\t"
+    # For comma-separated CSV
+    python neurolake_train.py --data_path dataset.csv --target_column target --sep ","
 
 Requirements:
-    - CSV file with headers (comma or tab separated)
-    - Target column specified
-    - Task type: 'regression', 'binclass', or 'multiclass'
+    - CSV file with headers (tab or comma separated)
+    - Target column specified for binary classification
     - Automatically excludes identifier columns (cpf, ref_date, etc.)
     
 Evaluation Metrics:
-    - Regression: Negative RMSE (higher is better)
     - Binary Classification: KS statistic (higher is better)
-    - Multiclass Classification: Accuracy (higher is better)
 """
 
 import argparse
@@ -32,7 +29,7 @@ import pickle
 import random
 import warnings
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -59,15 +56,9 @@ except ImportError:
     OPTUNA_AVAILABLE = False
 
 
-class RegressionLabelStats(NamedTuple):
-    mean: float
-    std: float
-
-
 def save_model_and_preprocessing(
     model,
     preprocessing_pipeline,
-    regression_label_stats,
     feature_info,
     model_config,
     save_dir: str = "saved_model"
@@ -88,7 +79,6 @@ def save_model_and_preprocessing(
     preprocessing_path = save_path / "preprocessing.pkl"
     preprocessing_data = {
         'preprocessing_pipeline': preprocessing_pipeline,
-        'regression_label_stats': regression_label_stats,
         'feature_info': feature_info,
     }
     
@@ -104,14 +94,13 @@ def save_model_and_preprocessing(
 def load_csv_dataset(
     data_path: str,
     target_column: str,
-    task_type: Literal['regression', 'binclass', 'multiclass'],
     categorical_columns: Optional[list] = None,
     test_size: float = 0.2,
     val_size: float = 0.2,
     random_state: int = 42,
-    sep: str = ','
+    sep: str = '\t'
 ):
-    """Load and preprocess CSV dataset for TabM training."""
+    """Load and preprocess CSV dataset for TabM binary classification training."""
     
     # Load data with specified separator
     df = pd.read_csv(data_path, sep=sep)
@@ -236,30 +225,22 @@ def load_csv_dataset(
         X_cat = X_cat_df.values.astype(np.int64) if len(categorical_columns) > 0 else None
         print(f"Categorical features: {len(categorical_columns)}, cardinalities: {cat_cardinalities}")
     
-    # Process target variable
-    if task_type == 'regression':
-        y = y.astype(np.float32)
-    else:
-        if task_type == 'binclass':
-            # Ensure binary classification has labels 0 and 1
-            le = sklearn.preprocessing.LabelEncoder()
-            y = le.fit_transform(y).astype(np.int64)
-            n_classes = 2
-        else:  # multiclass
-            le = sklearn.preprocessing.LabelEncoder()
-            y = le.fit_transform(y).astype(np.int64)
-            n_classes = len(np.unique(y))
-        
-        print(f"Classification task: {n_classes} classes")
+    # Process target variable for binary classification
+    # Ensure binary classification has labels 0 and 1
+    le = sklearn.preprocessing.LabelEncoder()
+    y = le.fit_transform(y).astype(np.int64)
+    n_classes = 2
+    
+    print(f"Binary classification: {n_classes} classes")
     
     # Split dataset
     indices = np.arange(len(y))
     train_val_idx, test_idx = sklearn.model_selection.train_test_split(
-        indices, test_size=test_size, random_state=random_state, stratify=y if task_type != 'regression' else None
+        indices, test_size=test_size, random_state=random_state, stratify=y
     )
     train_idx, val_idx = sklearn.model_selection.train_test_split(
         train_val_idx, test_size=val_size, random_state=random_state, 
-        stratify=y[train_val_idx] if task_type != 'regression' else None
+        stratify=y[train_val_idx]
     )
     
     # Create data splits
@@ -280,7 +261,6 @@ def load_csv_dataset(
         data_splits['test']['x_cat'] = X_cat[test_idx]
     
     n_num_features = X_num.shape[1] if X_num is not None else 0
-    n_classes = len(np.unique(y)) if task_type != 'regression' else None
     
     print(f"Dataset splits - Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
     print(f"Numerical features: {n_num_features}")
@@ -292,7 +272,7 @@ def load_csv_dataset(
         'cat_cardinalities': cat_cardinalities,
         'identifier_columns': identifier_columns,
         'target_column': target_column,
-        'task_type': task_type,
+        'task_type': 'binclass',
         'n_classes': n_classes,
         'label_encoders': label_encoders if categorical_columns else None,
     }
@@ -362,19 +342,17 @@ def preprocess_features(data_splits, n_num_features):
 def setup_model_and_training(
     n_num_features: int,
     cat_cardinalities: list,
-    n_classes: Optional[int],
-    task_type: str,
+    n_classes: int,
     device: torch.device,
     data_splits: dict,
-    use_embeddings: bool = False,
     hyperparams: Optional[dict] = None
 ):
-    """Setup TabM model and training components."""
+    """Setup TabM model with piecewise-linear embeddings and training components."""
     
     # Use provided hyperparams or defaults
     if hyperparams is None:
         hyperparams = {
-            'n_blocks': 2 if use_embeddings else 3,
+            'n_blocks': 2,
             'd_block': 512,
             'dropout': 0.1,
             'lr': 2e-3,
@@ -382,11 +360,12 @@ def setup_model_and_training(
             'd_embedding': 16,
         }
     
-    # Configure model architecture
+    # Configure model architecture with piecewise-linear embeddings
     bins = None
     num_embeddings = None
+    arch_type = 'tabm'
     
-    if use_embeddings and n_num_features > 0:
+    if n_num_features > 0:
         # Use TabM-mini with piecewise-linear embeddings for numerical features
         arch_type = 'tabm-mini'
         
@@ -426,8 +405,7 @@ def setup_model_and_training(
                     bins = None
                     num_embeddings = None
     else:
-        arch_type = 'tabm'
-        print(f"Using standard TabM architecture")
+        print(f"Using standard TabM architecture (no numerical features)")
     
     # Create model
     model = Model(
@@ -459,7 +437,7 @@ def setup_model_and_training(
         'n_num_features': n_num_features,
         'cat_cardinalities': cat_cardinalities,
         'n_classes': n_classes,
-        'task_type': task_type,
+        'task_type': 'binclass',
         'backbone': {
             'type': 'MLP',
             'n_blocks': hyperparams['n_blocks'],
@@ -471,7 +449,6 @@ def setup_model_and_training(
         'arch_type': arch_type,
         'k': 32,
         'share_training_batches': True,
-        'use_embeddings': use_embeddings,
         'hyperparams': hyperparams,
     }
     
@@ -479,8 +456,7 @@ def setup_model_and_training(
 
 
 def tune_hyperparameters(
-    data_splits, n_num_features, cat_cardinalities, n_classes, task_type, 
-    device, use_embeddings, n_trials=50, timeout=3600
+    data_splits, n_num_features, cat_cardinalities, n_classes, device, n_trials=50, timeout=3600
 ):
     """Tune hyperparameters using Optuna with TabM paper specifications."""
     
@@ -489,17 +465,10 @@ def tune_hyperparameters(
         return None
     
     def objective(trial):
-        # Sample hyperparameters according to TabM paper
-        if use_embeddings:
-            # TabM with embeddings ranges
-            n_blocks = trial.suggest_int('n_blocks', 1, 4)
-            lr = trial.suggest_float('lr', 5e-5, 3e-3, log=True)
-            d_embedding = trial.suggest_int('d_embedding', 8, 32)
-        else:
-            # Standard TabM ranges  
-            n_blocks = trial.suggest_int('n_blocks', 1, 5)
-            lr = trial.suggest_float('lr', 1e-4, 5e-3, log=True)
-            d_embedding = 16  # Not used without embeddings
+        # Sample hyperparameters according to TabM paper for embeddings
+        n_blocks = trial.suggest_int('n_blocks', 1, 4)
+        lr = trial.suggest_float('lr', 5e-5, 3e-3, log=True)
+        d_embedding = trial.suggest_int('d_embedding', 8, 32)
         
         d_block = trial.suggest_int('d_block', 64, 1024)
         dropout = trial.suggest_float('dropout', 0.0, 0.5)
@@ -522,13 +491,12 @@ def tune_hyperparameters(
         try:
             # Setup model with these hyperparams
             model, optimizer, _ = setup_model_and_training(
-                n_num_features, cat_cardinalities, n_classes, task_type, 
-                device, data_splits, use_embeddings, hyperparams
+                n_num_features, cat_cardinalities, n_classes, device, data_splits, hyperparams
             )
             
             # Longer training for better hyperparameter evaluation
             best_result = train_model(
-                model, optimizer, data_splits, task_type, device,
+                model, optimizer, data_splits, device,
                 n_epochs=1000, patience=50, batch_size=256, verbose=False
             )
             
@@ -555,20 +523,10 @@ def tune_hyperparameters(
 
 
 def train_model(
-    model, optimizer, data_splits, task_type, device,
+    model, optimizer, data_splits, device,
     n_epochs: int = 10000, patience: int = 1000, batch_size: int = 256, verbose: bool = True
 ):
-    """Train the TabM model."""
-    
-    # Handle label preprocessing for regression
-    regression_label_stats = None
-    Y_train = data_splits['train']['y'].copy()
-    
-    if task_type == 'regression':
-        regression_label_stats = RegressionLabelStats(
-            Y_train.mean().item(), Y_train.std().item()
-        )
-        Y_train = (Y_train - regression_label_stats.mean) / regression_label_stats.std
+    """Train the TabM model for binary classification."""
     
     # Convert to tensors
     data = {}
@@ -576,13 +534,8 @@ def train_model(
         data[split] = {}
         for key, value in data_splits[split].items():
             data[split][key] = torch.as_tensor(value, device=device)
-        
-        if task_type == 'regression':
-            data[split]['y'] = data[split]['y'].float()
     
-    Y_train = torch.as_tensor(Y_train, device=device)
-    if task_type == 'regression':
-        Y_train = Y_train.float()
+    Y_train = data['train']['y']
     
     @torch.autocast(device.type, enabled=False)
     def apply_model(part: str, idx: Tensor) -> Tensor:
@@ -594,11 +547,9 @@ def train_model(
             x_cat[idx] if x_cat is not None else None,
         ).squeeze(-1).float()
     
-    base_loss_fn = F.mse_loss if task_type == 'regression' else F.cross_entropy
-    
     def loss_fn(y_pred: Tensor, y_true: Tensor) -> Tensor:
-        k = y_pred.shape[-1 if task_type == 'regression' else -2]
-        return base_loss_fn(
+        k = y_pred.shape[-2]
+        return F.cross_entropy(
             y_pred.flatten(0, 1),
             y_true.repeat_interleave(k) if model.share_training_batches else y_true,
         )
@@ -613,39 +564,28 @@ def train_model(
             for idx in torch.arange(len(data[part]['y']), device=device).split(eval_batch_size)
         ]).cpu().numpy()
         
-        if task_type == 'regression' and regression_label_stats is not None:
-            y_pred = y_pred * regression_label_stats.std + regression_label_stats.mean
-        
-        if task_type != 'regression':
-            y_pred = scipy.special.softmax(y_pred, axis=-1)
-        
+        y_pred = scipy.special.softmax(y_pred, axis=-1)
         y_pred = y_pred.mean(1)
         y_true = data[part]['y'].cpu().numpy()
         
-        if task_type == 'regression':
-            score = -(sklearn.metrics.mean_squared_error(y_true, y_pred) ** 0.5)
-        elif task_type == 'binclass':
-            # For binary classification, calculate KS statistic
-            # Get probability of positive class (class 1)
-            y_pred_proba = y_pred[:, 1] if y_pred.ndim > 1 else y_pred
-            
-            # Calculate KS statistic using scipy.stats
-            from scipy import stats
-            
-            # Separate predictions for each class
-            pos_scores = y_pred_proba[y_true == 1]
-            neg_scores = y_pred_proba[y_true == 0]
-            
-            # Calculate KS statistic (Kolmogorov-Smirnov test)
-            if len(pos_scores) > 0 and len(neg_scores) > 0:
-                ks_stat, _ = stats.ks_2samp(pos_scores, neg_scores)
-                score = ks_stat
-            else:
-                # Fallback to accuracy if one class is missing
-                score = sklearn.metrics.accuracy_score(y_true, y_pred.argmax(1) if y_pred.ndim > 1 else (y_pred > 0.5).astype(int))
+        # For binary classification, calculate KS statistic
+        # Get probability of positive class (class 1)
+        y_pred_proba = y_pred[:, 1] if y_pred.ndim > 1 else y_pred
+        
+        # Calculate KS statistic using scipy.stats
+        from scipy import stats
+        
+        # Separate predictions for each class
+        pos_scores = y_pred_proba[y_true == 1]
+        neg_scores = y_pred_proba[y_true == 0]
+        
+        # Calculate KS statistic (Kolmogorov-Smirnov test)
+        if len(pos_scores) > 0 and len(neg_scores) > 0:
+            ks_stat, _ = stats.ks_2samp(pos_scores, neg_scores)
+            score = ks_stat
         else:
-            # For multiclass, keep using accuracy
-            score = sklearn.metrics.accuracy_score(y_true, y_pred.argmax(1))
+            # Fallback to accuracy if one class is missing
+            score = sklearn.metrics.accuracy_score(y_true, y_pred.argmax(1) if y_pred.ndim > 1 else (y_pred > 0.5).astype(int))
         
         return float(score)
     
@@ -655,15 +595,7 @@ def train_model(
     remaining_patience = patience
     
     if verbose:
-        # Clarify what the score represents based on task type
-        if task_type == 'regression':
-            metric_name = "Negative RMSE"
-        elif task_type == 'binclass':
-            metric_name = "KS Statistic"
-        else:
-            metric_name = "Accuracy"
-        
-        print(f'Initial test {metric_name}: {evaluate("test"):.4f}')
+        print(f'Initial test KS Statistic: {evaluate("test"):.4f}')
         print('-' * 80)
     
     for epoch in range(n_epochs):
@@ -703,19 +635,13 @@ def train_model(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train TabM on custom CSV dataset')
+    parser = argparse.ArgumentParser(description='Train TabM for binary classification with piecewise-linear embeddings')
     parser.add_argument('--data_path', type=str, required=True, help='Path to CSV file')
     parser.add_argument('--target_column', type=str, required=True, help='Name of target column')
-    parser.add_argument('--task_type', type=str, choices=['regression', 'binclass', 'multiclass'], 
-                       required=True, help='Type of task')
     parser.add_argument('--categorical_columns', type=str, nargs='*', default=None,
                        help='List of categorical column names (auto-detected if not specified)')
-    parser.add_argument('--sep', type=str, default=',',
-                       help='CSV separator (default: comma). Use "\\t" for tab-separated files')
-    parser.add_argument('--use_embeddings', action='store_true', default=True,
-                       help='Use TabM-mini with piecewise-linear embeddings for numerical features (default: True)')
-    parser.add_argument('--no_embeddings', action='store_true', 
-                       help='Use standard TabM instead of TabM-mini with embeddings')
+    parser.add_argument('--sep', type=str, default='\t',
+                       help='CSV separator (default: tab). Use "," for comma-separated files')
     parser.add_argument('--tune_hyperparams', action='store_true',
                        help='Enable hyperparameter tuning with Optuna (requires: pip install optuna)')
     parser.add_argument('--n_trials', type=int, default=50,
@@ -728,10 +654,6 @@ def main():
                        help='Directory to save model and preprocessing (default: auto-generated based on dataset name)')
     
     args = parser.parse_args()
-    
-    # Handle embedding flags
-    if args.no_embeddings:
-        args.use_embeddings = False
     
     # Handle separator (convert \t string to actual tab character)
     if args.sep == '\\t':
@@ -749,7 +671,7 @@ def main():
     # Load and preprocess dataset
     print(f'Loading dataset from {args.data_path}...')
     data_splits, n_num_features, cat_cardinalities, n_classes, feature_info = load_csv_dataset(
-        args.data_path, args.target_column, args.task_type, args.categorical_columns, sep=args.sep
+        args.data_path, args.target_column, args.categorical_columns, sep=args.sep
     )
     
     # Preprocess features
@@ -758,25 +680,18 @@ def main():
     # Add keep_indices to feature_info for inference
     feature_info['keep_indices'] = keep_indices
     
-    # Validate embeddings usage
-    if args.use_embeddings and n_num_features == 0:
-        print("Warning: --use_embeddings specified but no numerical features found. Using standard TabM.")
-        args.use_embeddings = False
-    
     # Hyperparameter tuning or use defaults
     hyperparams = None
     if args.tune_hyperparams:
         hyperparams = tune_hyperparameters(
-            data_splits, n_num_features, cat_cardinalities, n_classes, 
-            args.task_type, device, args.use_embeddings, args.n_trials
+            data_splits, n_num_features, cat_cardinalities, n_classes, device, args.n_trials
         )
         if hyperparams is None:
             print("Hyperparameter tuning failed, using default parameters")
     
     # Setup model and training
     model, optimizer, model_config = setup_model_and_training(
-        n_num_features, cat_cardinalities, n_classes, args.task_type, 
-        device, data_splits, args.use_embeddings, hyperparams
+        n_num_features, cat_cardinalities, n_classes, device, data_splits, hyperparams
     )
     
     print(f'Model created with {sum(p.numel() for p in model.parameters())} parameters')
@@ -786,48 +701,30 @@ def main():
     
     # Train model
     best_result = train_model(
-        model, optimizer, data_splits, args.task_type, device,
+        model, optimizer, data_splits, device,
         args.n_epochs, args.patience, args.batch_size
     )
     
     print('\n' + '='*80)
     print('Training completed!')
-    
-    # Clarify what the score represents based on task type
-    if args.task_type == 'regression':
-        metric_name = "Negative RMSE"
-    elif args.task_type == 'binclass':
-        metric_name = "KS Statistic"
-    else:
-        metric_name = "Accuracy"
-    
-    print(f'Best validation {metric_name}: {best_result["val"]:.4f}')
-    print(f'Best test {metric_name}: {best_result["test"]:.4f}')
+    print(f'Best validation KS Statistic: {best_result["val"]:.4f}')
+    print(f'Best test KS Statistic: {best_result["test"]:.4f}')
     print(f'Best epoch: {best_result["epoch"]}')
     
     # Save model and preprocessing
     print('\n' + '-'*80)
     print('Saving model and preprocessing...')
     
-    # Create save directory name based on dataset and task
+    # Create save directory name based on dataset
     if args.save_dir:
         save_dir = args.save_dir
     else:
         dataset_name = Path(args.data_path).stem
-        save_dir = f"saved_model_{dataset_name}_{args.task_type}"
-    
-    # Handle regression label stats for saving
-    regression_label_stats = None
-    if args.task_type == 'regression':
-        Y_train = data_splits['train']['y']
-        regression_label_stats = RegressionLabelStats(
-            Y_train.mean().item(), Y_train.std().item()
-        )
+        save_dir = f"saved_model_{dataset_name}_binclass"
     
     model_path, preprocessing_path = save_model_and_preprocessing(
         model=model,
         preprocessing_pipeline=preprocessing,
-        regression_label_stats=regression_label_stats,
         feature_info=feature_info,
         model_config=model_config,
         save_dir=save_dir
