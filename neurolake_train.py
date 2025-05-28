@@ -188,8 +188,19 @@ def load_csv_dataset(
             X_num_df = X_num_df.fillna(0)
             X_num_df = X_num_df.replace([np.inf, -np.inf], 0)
         
-        X_num = X_num_df.values
-        print(f"Numerical features cleaned: {X_num.shape}")
+        # Filter out numerical features with only one unique value
+        constant_features = []
+        for col in X_num_df.columns:
+            if X_num_df[col].nunique() <= 1:
+                constant_features.append(col)
+        
+        if constant_features:
+            print(f"Removing {len(constant_features)} numerical features with constant values")
+            X_num_df = X_num_df.drop(columns=constant_features)
+            numerical_columns = [col for col in numerical_columns if col not in constant_features]
+        
+        X_num = X_num_df.values if len(X_num_df.columns) > 0 else None
+        print(f"Numerical features cleaned: {X_num.shape if X_num is not None else 'None'}")
     
     X_cat = None
     cat_cardinalities = []
