@@ -459,9 +459,9 @@ def tune_hyperparameters(
     
     def objective(trial):
         # Sample hyperparameters according to TabM paper for embeddings
-        n_blocks = trial.suggest_int('n_blocks', 1, 4)
-        lr = trial.suggest_float('lr', 5e-5, 3e-3, log=True)
-        d_embedding = trial.suggest_int('d_embedding', 8, 32)
+        n_blocks = trial.suggest_int('n_blocks', 1, 6)
+        lr = trial.suggest_float('lr', 5e-5, 3e-2, log=True)
+        d_embedding = trial.suggest_int('d_embedding', 8, 128)
         
         d_block = trial.suggest_int('d_block', 64, 1024)
         dropout = trial.suggest_float('dropout', 0.0, 0.5)
