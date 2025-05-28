@@ -18,6 +18,7 @@ Requirements:
     - CSV file with headers (tab or comma separated)
     - Target column specified for binary classification
     - Automatically excludes identifier columns (cpf, ref_date, etc.)
+    - Uses 70% train / 30% validation split (test will be done separately)
     
 Evaluation Metrics:
     - Binary Classification: KS statistic (higher is better)
@@ -95,8 +96,7 @@ def load_csv_dataset(
     data_path: str,
     target_column: str,
     categorical_columns: Optional[list] = None,
-    test_size: float = 0.2,
-    val_size: float = 0.2,
+    val_size: float = 0.3,
     random_state: int = 42,
     sep: str = '\t'
 ):
@@ -233,36 +233,29 @@ def load_csv_dataset(
     
     print(f"Binary classification: {n_classes} classes")
     
-    # Split dataset
+    # Split dataset into 70% train and 30% validation
     indices = np.arange(len(y))
-    train_val_idx, test_idx = sklearn.model_selection.train_test_split(
-        indices, test_size=test_size, random_state=random_state, stratify=y
-    )
     train_idx, val_idx = sklearn.model_selection.train_test_split(
-        train_val_idx, test_size=val_size, random_state=random_state, 
-        stratify=y[train_val_idx]
+        indices, test_size=val_size, random_state=random_state, stratify=y
     )
     
-    # Create data splits
+    # Create data splits (only train and val)
     data_splits = {
         'train': {'y': y[train_idx]},
-        'val': {'y': y[val_idx]},
-        'test': {'y': y[test_idx]}
+        'val': {'y': y[val_idx]}
     }
     
     if X_num is not None:
         data_splits['train']['x_cont'] = X_num[train_idx]
         data_splits['val']['x_cont'] = X_num[val_idx]
-        data_splits['test']['x_cont'] = X_num[test_idx]
     
     if X_cat is not None:
         data_splits['train']['x_cat'] = X_cat[train_idx]
         data_splits['val']['x_cat'] = X_cat[val_idx]
-        data_splits['test']['x_cat'] = X_cat[test_idx]
     
     n_num_features = X_num.shape[1] if X_num is not None else 0
     
-    print(f"Dataset splits - Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    print(f"Dataset splits - Train: {len(train_idx)} (70%), Val: {len(val_idx)} (30%)")
     print(f"Numerical features: {n_num_features}")
     
     # Create feature info for inference
@@ -591,11 +584,11 @@ def train_model(
     
     # Training loop
     train_size = len(Y_train)
-    best = {'val': -math.inf, 'test': -math.inf, 'epoch': -1}
+    best = {'val': -math.inf, 'epoch': -1}
     remaining_patience = patience
     
     if verbose:
-        print(f'Initial test KS Statistic: {evaluate("test"):.4f}')
+        print(f'Initial validation KS Statistic: {evaluate("val"):.4f}')
         print('-' * 80)
     
     for epoch in range(n_epochs):
@@ -612,16 +605,15 @@ def train_model(
         
         # Evaluation
         val_score = evaluate('val')
-        test_score = evaluate('test')
         
         if verbose:
-            print(f'Epoch {epoch}: (val) {val_score:.4f} (test) {test_score:.4f}')
+            print(f'Epoch {epoch}: (val) {val_score:.4f}')
         
         # Early stopping
         if val_score > best['val']:
             if verbose:
                 print('🌸 New best epoch! 🌸')
-            best = {'val': val_score, 'test': test_score, 'epoch': epoch}
+            best = {'val': val_score, 'epoch': epoch}
             remaining_patience = patience
         else:
             remaining_patience -= 1
@@ -708,7 +700,6 @@ def main():
     print('\n' + '='*80)
     print('Training completed!')
     print(f'Best validation KS Statistic: {best_result["val"]:.4f}')
-    print(f'Best test KS Statistic: {best_result["test"]:.4f}')
     print(f'Best epoch: {best_result["epoch"]}')
     
     # Save model and preprocessing
