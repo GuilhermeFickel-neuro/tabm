@@ -304,7 +304,7 @@ def preprocess_features(data_splits, n_num_features):
     """Preprocess numerical features using quantile transformation."""
     
     if n_num_features == 0:
-        return data_splits, None, n_num_features
+        return data_splits, None, n_num_features, None
     
     # Advanced preprocessing with quantile transformation
     X_train = data_splits['train']['x_cont']
@@ -331,6 +331,9 @@ def preprocess_features(data_splits, n_num_features):
         if np.allclose(feature_values, feature_values[0], rtol=1e-10, atol=1e-10):
             constant_feature_indices.append(i)
     
+    # Store the indices of features to keep for inference
+    keep_indices = None
+    
     if constant_feature_indices:
         print(f"Removing {len(constant_feature_indices)} numerical features that became constant after preprocessing")
         
@@ -343,7 +346,7 @@ def preprocess_features(data_splits, n_num_features):
             for split in data_splits:
                 if 'x_cont' in data_splits[split]:
                     del data_splits[split]['x_cont']
-            return data_splits, preprocessing, 0
+            return data_splits, preprocessing, 0, None
         
         # Filter out constant features from all splits
         for split in data_splits:
@@ -353,7 +356,7 @@ def preprocess_features(data_splits, n_num_features):
         n_num_features = len(keep_indices)
         print(f"Numerical features after preprocessing: {n_num_features}")
     
-    return data_splits, preprocessing, n_num_features
+    return data_splits, preprocessing, n_num_features, keep_indices
 
 
 def setup_model_and_training(
@@ -750,7 +753,10 @@ def main():
     )
     
     # Preprocess features
-    data_splits, preprocessing, n_num_features = preprocess_features(data_splits, n_num_features)
+    data_splits, preprocessing, n_num_features, keep_indices = preprocess_features(data_splits, n_num_features)
+    
+    # Add keep_indices to feature_info for inference
+    feature_info['keep_indices'] = keep_indices
     
     # Validate embeddings usage
     if args.use_embeddings and n_num_features == 0:

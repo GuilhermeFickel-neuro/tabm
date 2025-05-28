@@ -152,6 +152,12 @@ def preprocess_inference_data(
         if preprocessing_pipeline is not None:
             X_num = preprocessing_pipeline.transform(X_num)
         
+        # Apply the same feature filtering as during training
+        keep_indices = feature_info.get('keep_indices', None)
+        if keep_indices is not None:
+            print(f"Applying feature filtering: keeping {len(keep_indices)} out of {X_num.shape[1]} features (matching training)")
+            X_num = X_num[:, keep_indices]
+        
         print(f"Numerical features processed: {X_num.shape}")
     
     # Process categorical features
