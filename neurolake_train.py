@@ -205,7 +205,24 @@ def load_csv_dataset(
             label_encoders[col] = le
             cat_cardinalities.append(len(le.classes_))
         
-        X_cat = X_cat_df.values.astype(np.int64)
+        # Filter out features with cardinality 1
+        filtered_indices = [i for i, card in enumerate(cat_cardinalities) if card > 1]
+        if len(filtered_indices) < len(cat_cardinalities):
+            n_removed = len(cat_cardinalities) - len(filtered_indices)
+            print(f"Removing {n_removed} categorical features with cardinality 1")
+            
+            # Keep only features with cardinality > 1
+            filtered_categorical_columns = [categorical_columns[i] for i in filtered_indices]
+            filtered_cat_cardinalities = [cat_cardinalities[i] for i in filtered_indices]
+            filtered_label_encoders = {col: label_encoders[col] for col in filtered_categorical_columns}
+            
+            # Update the data
+            X_cat_df = X_cat_df[filtered_categorical_columns]
+            categorical_columns = filtered_categorical_columns
+            cat_cardinalities = filtered_cat_cardinalities
+            label_encoders = filtered_label_encoders
+        
+        X_cat = X_cat_df.values.astype(np.int64) if len(categorical_columns) > 0 else None
         print(f"Categorical features: {len(categorical_columns)}, cardinalities: {cat_cardinalities}")
     
     # Process target variable
